@@ -1,0 +1,24 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+
+# Build and packaging
+build/
+dist/
+*.egg-info/
+
+# IDE and OS
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Logs and generated data
+logs/*.log
+output/*.csv
+data/raw/*.csv
+data/processed/*.csv

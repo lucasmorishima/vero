@@ -1,0 +1,1 @@
+"""Pacote base do pipeline."""

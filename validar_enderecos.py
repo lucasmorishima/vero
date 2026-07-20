@@ -189,6 +189,11 @@ def _limpar_doc(doc: str) -> str:
     return re.sub(r"\D", "", str(doc).strip())
 
 
+def _cep_generico(cep: str) -> bool:
+    """CEPs terminados em 000 são genéricos (sede do município) e não identificam endereço específico."""
+    return len(cep) == 8 and cep.endswith("000")
+
+
 def tipo_documento(doc: str) -> str:
     d = _limpar_doc(doc)
     if len(d) == 11:
@@ -325,10 +330,24 @@ def processar_planilha(arquivo_entrada: str | Path = "base teste.csv") -> None:
     arquivo_entrada = Path(arquivo_entrada)
     df = pd.read_csv(arquivo_entrada, dtype=str, encoding="utf-8-sig", sep=None, engine="python")
 
-    col_doc = _encontrar_coluna(df, ["CPF_CNPJ", "CPF/CNPJ", "DOCUMENTO", "CNPJ", "CPF", "DOC"])
-    col_cep = _encontrar_coluna(df, ["CEP"])
-    col_fatura = _encontrar_coluna(df, ["FATURA"])
-    col_id     = _encontrar_coluna(df, ["ID_CLIENTE_CONTRATO", "ID_CLIENTE", "ID"])
+    col_doc     = _encontrar_coluna(df, ["CPF_CNPJ", "CPF/CNPJ", "DOCUMENTO", "CNPJ", "CPF", "DOC"])
+    col_cep     = _encontrar_coluna(df, ["CEP"])
+    col_fatura  = _encontrar_coluna(df, ["FATURA"])
+    col_id      = _encontrar_coluna(df, ["ID_CLIENTE_CONTRATO", "ID_CLIENTE", "ID"])
+    col_regra   = _encontrar_coluna(df, ["REGRA"])
+    col_cidade  = _encontrar_coluna(df, ["CIDADE", "CITY"])
+    col_bairro  = _encontrar_coluna(df, ["BAIRRO"])
+    col_uf      = _encontrar_coluna(df, ["UF", "ESTADO", "STATE"])
+    col_nome    = _encontrar_coluna(df, ["NOME_CLIENTE", "NOME", "CLIENTE"])
+    col_ie      = _encontrar_coluna(df, ["INSCRICAO_ESTADUAL", "IE"])
+    col_produto = _encontrar_coluna(df, ["PRODUTO"])
+    col_tpsvc   = _encontrar_coluna(df, ["TIPO_SERVICO"])
+    col_dssvc   = _encontrar_coluna(df, ["DESCRICAO_SERVICO"])
+    col_imposto = _encontrar_coluna(df, ["TIPO_IMPOSTO"])
+    col_promo   = _encontrar_coluna(df, ["PROMOCAO"])
+    col_grupo   = _encontrar_coluna(df, ["GRUPO_LOCALIDADE"])
+    col_lote    = _encontrar_coluna(df, ["ID_LOTE"])
+    col_seg     = _encontrar_coluna(df, ["SEGMENTO"])
 
     if col_doc is None:
         raise ValueError(
@@ -356,19 +375,85 @@ def processar_planilha(arquivo_entrada: str | Path = "base teste.csv") -> None:
 
     linhas_validacao: list[dict] = []
     linhas_cadastrais: list[dict] = []
+    linhas_relatorio: list[dict] = []
 
     for i, row in df.iterrows():
-        doc_raw  = str(row[col_doc]).strip()
-        cep_raw  = str(row[col_cep]).replace("-", "").replace(".", "").strip().zfill(8)
-        tipo     = tipo_documento(doc_raw)
-        doc_num  = _limpar_doc(doc_raw)
-        fatura   = str(row[col_fatura]).strip() if col_fatura else ""
-        id_cli   = str(row[col_id]).strip()     if col_id     else ""
+        doc_raw     = str(row[col_doc]).strip()
+        cep_raw     = str(row[col_cep]).replace("-", "").replace(".", "").strip().zfill(8)
+        tipo        = tipo_documento(doc_raw)
+        doc_num     = _limpar_doc(doc_raw)
+        def _val(col):
+            v = str(row[col]).strip() if col and col in row.index else ""
+            return "" if v in ("nan", "None") else v
+
+        fatura      = _val(col_fatura)
+        id_cli      = _val(col_id)
+        regra       = _val(col_regra)
+        cidade_base = _val(col_cidade)
+        bairro_base = _val(col_bairro)
+        uf_base     = _val(col_uf)
+        nome_base   = _val(col_nome)
+        ie_base     = _val(col_ie)
+        produto     = _val(col_produto)
+        tipo_svc    = _val(col_tpsvc)
+        desc_svc    = _val(col_dssvc)
+        imposto     = _val(col_imposto)
+        promo       = _val(col_promo)
+        grupo       = _val(col_grupo)
+        lote        = _val(col_lote)
+        segmento    = _val(col_seg)
+
+        # Remove sufixos como " - AN" que aparecem na cidade da base interna
+        cidade_base_limpa = re.sub(r"\s*-\s*\w+$", "", cidade_base).strip()
 
         # Prefixo de rastreabilidade presente em todas as linhas de saída
-        prefixo = {"Fatura": fatura, "ID_Cliente": id_cli}
+        prefixo = {
+            "Fatura":      fatura,
+            "ID_Cliente":  id_cli,
+            "Regra":       regra,
+            "Segmento":    segmento,
+            "Cidade_Base": cidade_base,
+            "Bairro_Base": bairro_base,
+            "UF_Base":     uf_base,
+            "Nome_Cliente_Base": nome_base,
+            "IE_Base":     ie_base,
+            "Produto":     produto,
+            "Tipo_Servico": tipo_svc,
+            "Descricao_Servico": desc_svc,
+            "Tipo_Imposto": imposto,
+            "Promocao":    promo,
+            "Grupo_Localidade": grupo,
+            "ID_Lote":     lote,
+        }
 
         print(f"  [{int(i)+1:4d}/{total}] {doc_raw[:18]:<20} ({tipo}) ", end="", flush=True)
+
+        # Rejeita CEP genérico (sede de município, termina em 000) antes de qualquer consulta
+        if _cep_generico(cep_raw):
+            obs_gen = f"[CEP] CEP genérico não aceito: {cep_raw[:5]}-{cep_raw[5:]} (representa sede do município, não um endereço específico)"
+            linhas_validacao.append({
+                **prefixo,
+                "Documento":        doc_num if tipo != "INVALIDO" else doc_raw,
+                "Tipo":             tipo,
+                "CEP_Informado":    cep_raw,
+                "Status_Validacao": "CEP genérico",
+                "Observacao":       obs_gen,
+            })
+            dados_billing_gen = (
+                f"NOME: {nome_base} | DOC: {doc_num or doc_raw} | CEP: {cep_raw}"
+                f" | CIDADE: {cidade_base} | UF: {uf_base} | IE: {ie_base or '-'}"
+            )
+            linhas_relatorio.append({
+                "FATURA": fatura, "ID_CONTA_CONTRATO": id_cli, "REGRA": regra, "SEGMENTO": segmento,
+                "STATUS": "INCORRETO", "SUBSTATUS": "ERRO",
+                "OBSERVACAO": obs_gen,
+                "DADOS_BILLING": dados_billing_gen, "DADOS_CONTRATO": None, "DADOS_TABELA_VERDADE": None,
+                "ID_LOTE": lote, "PRODUTO": produto, "TIPO_SERVICO": tipo_svc,
+                "DESCRICAO_SERVICO": desc_svc, "TIPO_IMPOSTO": imposto,
+                "PROMOCAO": promo or None, "GRUPO_LOCALIDADE": grupo,
+            })
+            print(f"— CEP GENÉRICO REJEITADO ({cep_raw[:5]}-{cep_raw[5:]})")
+            continue
 
         if tipo == "INVALIDO":
             linhas_validacao.append({
@@ -377,6 +462,16 @@ def processar_planilha(arquivo_entrada: str | Path = "base teste.csv") -> None:
                 "Tipo":              "INVALIDO",
                 "CEP_Informado":     cep_raw,
                 "Status_Validacao":  "Documento inválido",
+            })
+            dados_billing = f"DOC: {doc_raw} | CEP: {cep_raw} | CIDADE: {cidade_base} | UF: {uf_base}"
+            linhas_relatorio.append({
+                "FATURA": fatura, "ID_CONTA_CONTRATO": id_cli, "REGRA": regra, "SEGMENTO": segmento,
+                "STATUS": "INCORRETO", "SUBSTATUS": "ERRO",
+                "OBSERVACAO": "[DOC] Documento inválido",
+                "DADOS_BILLING": dados_billing, "DADOS_CONTRATO": None, "DADOS_TABELA_VERDADE": None,
+                "ID_LOTE": lote, "PRODUTO": produto, "TIPO_SERVICO": tipo_svc,
+                "DESCRICAO_SERVICO": desc_svc, "TIPO_IMPOSTO": imposto,
+                "PROMOCAO": promo or None, "GRUPO_LOCALIDADE": grupo,
             })
             print("— DOCUMENTO INVÁLIDO")
             continue
@@ -400,6 +495,18 @@ def processar_planilha(arquivo_entrada: str | Path = "base teste.csv") -> None:
                     "Fonte_CEP":         end.get("Fonte_CEP", ""),
                     "Status_Validacao":  "CEP encontrado",
                 })
+                dados_billing_cpf = (
+                    f"NOME: {nome_base} | DOC: {doc_num} | CEP: {cep_raw}"
+                    f" | CIDADE: {cidade_base} | UF: {uf_base} | IE: {ie_base or '-'}"
+                )
+                linhas_relatorio.append({
+                    "FATURA": fatura, "ID_CONTA_CONTRATO": id_cli, "REGRA": regra, "SEGMENTO": segmento,
+                    "STATUS": "CORRETO", "SUBSTATUS": "OK", "OBSERVACAO": "",
+                    "DADOS_BILLING": dados_billing_cpf, "DADOS_CONTRATO": None, "DADOS_TABELA_VERDADE": None,
+                    "ID_LOTE": lote, "PRODUTO": produto, "TIPO_SERVICO": tipo_svc,
+                    "DESCRICAO_SERVICO": desc_svc, "TIPO_IMPOSTO": imposto,
+                    "PROMOCAO": promo or None, "GRUPO_LOCALIDADE": grupo,
+                })
                 print(f"— {end.get('Logradouro','')[:35]}, {end.get('Cidade','')}/{end.get('UF','')}")
             except Exception as exc:
                 linhas_validacao.append({
@@ -408,6 +515,19 @@ def processar_planilha(arquivo_entrada: str | Path = "base teste.csv") -> None:
                     "Tipo":             "CPF",
                     "CEP_Informado":    cep_raw,
                     "Status_Validacao": f"Erro CEP: {exc}",
+                })
+                dados_billing_cpf = (
+                    f"NOME: {nome_base} | DOC: {doc_num} | CEP: {cep_raw}"
+                    f" | CIDADE: {cidade_base} | UF: {uf_base} | IE: {ie_base or '-'}"
+                )
+                linhas_relatorio.append({
+                    "FATURA": fatura, "ID_CONTA_CONTRATO": id_cli, "REGRA": regra, "SEGMENTO": segmento,
+                    "STATUS": "INCORRETO", "SUBSTATUS": "ERRO",
+                    "OBSERVACAO": f"[CEP] CEP não encontrado: {cep_raw}",
+                    "DADOS_BILLING": dados_billing_cpf, "DADOS_CONTRATO": None, "DADOS_TABELA_VERDADE": None,
+                    "ID_LOTE": lote, "PRODUTO": produto, "TIPO_SERVICO": tipo_svc,
+                    "DESCRICAO_SERVICO": desc_svc, "TIPO_IMPOSTO": imposto,
+                    "PROMOCAO": promo or None, "GRUPO_LOCALIDADE": grupo,
                 })
                 print(f"— ERRO CEP: {exc}")
             if delay:
@@ -428,6 +548,19 @@ def processar_planilha(arquivo_entrada: str | Path = "base teste.csv") -> None:
                 "CEP_Informado":    cep_raw,
                 "Status_Validacao": f"Erro Receita: {receita.get('receita_status')}",
             })
+            dados_billing_cnpj_err = (
+                f"NOME: {nome_base} | DOC: {doc_num} | CEP: {cep_raw}"
+                f" | CIDADE: {cidade_base} | UF: {uf_base} | IE: {ie_base or '-'}"
+            )
+            linhas_relatorio.append({
+                "FATURA": fatura, "ID_CONTA_CONTRATO": id_cli, "REGRA": regra, "SEGMENTO": segmento,
+                "STATUS": "INCORRETO", "SUBSTATUS": "ERRO",
+                "OBSERVACAO": f"[API] Erro na consulta Receita: {receita.get('receita_status')}",
+                "DADOS_BILLING": dados_billing_cnpj_err, "DADOS_CONTRATO": None, "DADOS_TABELA_VERDADE": None,
+                "ID_LOTE": lote, "PRODUTO": produto, "TIPO_SERVICO": tipo_svc,
+                "DESCRICAO_SERVICO": desc_svc, "TIPO_IMPOSTO": imposto,
+                "PROMOCAO": promo or None, "GRUPO_LOCALIDADE": grupo,
+            })
             print(f"— ERRO RECEITA: {receita.get('receita_status')}")
             continue
 
@@ -441,7 +574,37 @@ def processar_planilha(arquivo_entrada: str | Path = "base teste.csv") -> None:
         if delay:
             time.sleep(delay)
 
-        status_validacao = comparar_enderecos(receita, end_correios)
+        status_end = comparar_enderecos(receita, end_correios)
+
+        # Comparação base interna vs Receita Federal
+        cidade_rec = _normalizar(receita.get("receita_municipio", ""))
+        uf_rec     = _normalizar(receita.get("receita_uf", ""))
+        cidade_ok  = not cidade_base_limpa or not cidade_rec or _normalizar(cidade_base_limpa) == cidade_rec
+        uf_ok      = not uf_base or not uf_rec or _normalizar(uf_base) == uf_rec
+        cep_ok     = cep_raw == cep_receita
+
+        divergencias = []
+        if _cep_generico(cep_receita):
+            divergencias.append(
+                f"[CEP] CEP da Receita é genérico: {cep_receita[:5]}-{cep_receita[5:]} (sede do município)"
+            )
+        if not cep_ok:
+            divergencias.append(f"CEP divergente: base '{cep_raw}' x Receita '{cep_receita}'")
+        if not cidade_ok:
+            divergencias.append(
+                f"Cidade divergente: base '{cidade_base_limpa}' x Receita '{receita.get('receita_municipio','')}'"
+            )
+        if not uf_ok:
+            divergencias.append(
+                f"UF divergente: base '{uf_base}' x Receita '{receita.get('receita_uf','')}'"
+            )
+        if status_end == "Divergente":
+            divergencias.append("Endereço Receita x Correios divergente")
+        elif status_end == "CEP não encontrado nos Correios":
+            divergencias.append("CEP da Receita não encontrado nos Correios")
+
+        status_validacao = "Divergente" if divergencias else "Confere"
+        observacao       = " | ".join(divergencias)
 
         linhas_validacao.append({
             **prefixo,
@@ -449,7 +612,9 @@ def processar_planilha(arquivo_entrada: str | Path = "base teste.csv") -> None:
             "Tipo":                     "CNPJ",
             "CEP_Informado":            cep_raw,
             "CEP_Receita":              cep_receita,
-            "CEP_Confere_com_Informado": "Sim" if cep_raw == cep_receita else "Não",
+            "CEP_Confere_com_Informado": "Sim" if cep_ok else "Não",
+            "Cidade_Confere":           "Sim" if cidade_ok else "Não",
+            "UF_Confere":               "Sim" if uf_ok else "Não",
             # Endereço da Receita
             "Logradouro_Receita":       receita.get("receita_logradouro", ""),
             "Numero_Receita":           receita.get("receita_numero", ""),
@@ -465,8 +630,35 @@ def processar_planilha(arquivo_entrada: str | Path = "base teste.csv") -> None:
             "Fonte_CEP":                end_correios.get("Fonte_CEP", ""),
             # Resultado
             "Status_Validacao":         status_validacao,
+            "Observacao":               observacao,
             "Razao_Social":             receita.get("razao_social", ""),
             "Situacao_Cadastral":       receita.get("situacao_cadastral", ""),
+        })
+
+        # Monta strings consolidadas para o relatório
+        _end_rec = (
+            f"{receita.get('receita_logradouro','')}, {receita.get('receita_numero','')}"
+            f" - {receita.get('receita_bairro','')} - {receita.get('receita_municipio','')}/{receita.get('receita_uf','')}"
+        ).strip(", -/")
+        dados_billing_ok = (
+            f"NOME: {nome_base} | DOC: {doc_num} | CEP: {cep_raw}"
+            f" | CIDADE: {cidade_base} | UF: {uf_base} | IE: {ie_base or '-'}"
+        )
+        dados_contrato_ok = (
+            f"RAZAO: {receita.get('razao_social','')} | SITUACAO: {receita.get('situacao_cadastral','')}"
+            f" | CEP: {cep_receita} | END: {_end_rec}"
+        )
+        linhas_relatorio.append({
+            "FATURA": fatura, "ID_CONTA_CONTRATO": id_cli, "REGRA": regra, "SEGMENTO": segmento,
+            "STATUS": "INCORRETO" if divergencias else "CORRETO",
+            "SUBSTATUS": "ERRO" if divergencias else "OK",
+            "OBSERVACAO": observacao,
+            "DADOS_BILLING": dados_billing_ok,
+            "DADOS_CONTRATO": dados_contrato_ok,
+            "DADOS_TABELA_VERDADE": None,
+            "ID_LOTE": lote, "PRODUTO": produto, "TIPO_SERVICO": tipo_svc,
+            "DESCRICAO_SERVICO": desc_svc, "TIPO_IMPOSTO": imposto,
+            "PROMOCAO": promo or None, "GRUPO_LOCALIDADE": grupo,
         })
 
         linhas_cadastrais.append({
@@ -510,14 +702,18 @@ def processar_planilha(arquivo_entrada: str | Path = "base teste.csv") -> None:
     if linhas_cadastrais:
         pd.DataFrame(linhas_cadastrais).to_csv(arq_cadastral, index=False, encoding="utf-8-sig")
 
+    arq_relatorio = pasta_saida / "relatorio_validacao.csv"
+    pd.DataFrame(linhas_relatorio).to_csv(arq_relatorio, index=False, encoding="utf-8-sig")
+
     ok   = sum(1 for r in linhas_validacao if r.get("Status_Validacao") in ("Confere", "CEP encontrado"))
     div  = sum(1 for r in linhas_validacao if r.get("Status_Validacao") == "Divergente")
-    erro = total - ok - div
+    erro = sum(1 for r in linhas_validacao if r.get("Status_Validacao") not in ("Confere", "CEP encontrado", "Divergente"))
 
     print(f"\nConcluído: {ok} OK | {div} divergente(s) | {erro} erro(s)")
     print(f"  → {arq_validacao}")
     if linhas_cadastrais:
         print(f"  → {arq_cadastral}  ({len(linhas_cadastrais)} CNPJs)")
+    print(f"  → {arq_relatorio}  ({len(linhas_relatorio)} registros)")
 
 
 if __name__ == "__main__":

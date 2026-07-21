@@ -316,45 +316,44 @@ for i, row in df.iterrows():
 
     print(f"  [{int(i)+1:4d}/{total}] {doc_raw[:18]:<20} ({tipo}) ", end="", flush=True)
 
-    # --- CEP genérico: valida localidade antes de decidir status ---
-    if _cep_generico(cep_raw):
+    # --- CEP genérico para CPF: valida município via ViaCEP e encerra
+    # Para CNPJ: deixa passar — município será validado com receita_municipio adiante ---
+    if _cep_generico(cep_raw) and tipo == "CPF":
         try:
             end_gen    = consultar_cep(cep_raw)
             cidade_gen = _normalizar(end_gen.get("Cidade", ""))
-            uf_gen     = _normalizar(end_gen.get("UF", ""))
             loc_str    = f"{end_gen.get('Cidade','')}/{end_gen.get('UF','')}"
-            cidade_ok_gen = bool(cidade_gen) and _normalizar(cidade_base_limpa) == cidade_gen
-            uf_ok_gen     = not uf_base or not uf_gen or _normalizar(uf_base) == uf_gen
         except Exception:
-            cidade_ok_gen = False
-            uf_ok_gen     = False
-            loc_str       = "não identificada"
+            cidade_gen = ""
+            loc_str    = "não identificada"
 
+        cidade_ok_gen = bool(cidade_gen) and _normalizar(cidade_base_limpa) == cidade_gen
         nota_gen = f"[CEP] CEP genérico: {cep_raw[:5]}-{cep_raw[5:]} (representa sede do município)"
-        if cidade_ok_gen and uf_ok_gen:
-            obs_gen        = f"{nota_gen} | Localidade confirmada: {loc_str}"
+        if cidade_ok_gen:
+            obs_gen        = f"{nota_gen} | Município confirmado: {loc_str}"
             status_gen     = "CORRETO"
             substatus_gen  = "ALERTA"
-            status_val_gen = "CEP genérico - localidade confirmada"
+            status_val_gen = "CEP genérico - município confirmado"
         else:
-            obs_gen        = f"{nota_gen} | Localidade divergente: base '{cidade_base_limpa}/{uf_base}' x CEP '{loc_str}'"
+            obs_gen        = f"{nota_gen} | Município divergente: base '{cidade_base_limpa}' x CEP '{loc_str}'"
             status_gen     = "INCORRETO"
             substatus_gen  = "ERRO"
-            status_val_gen = "CEP genérico - localidade divergente"
+            status_val_gen = "CEP genérico - município divergente"
 
-        linhas_validacao.append({**prefixo, "Documento": doc_num or doc_raw,
-                                  "Tipo": tipo, "CEP_Informado": cep_raw,
+        linhas_validacao.append({**prefixo, "Documento": doc_num, "Tipo": "CPF",
+                                  "CEP_Informado": cep_raw,
                                   "Status_Validacao": status_val_gen, "Observacao": obs_gen})
         linhas_relatorio.append({
             "FATURA": fatura, "ID_CONTA_CONTRATO": id_cli, "REGRA": regra, "SEGMENTO": segmento,
             "STATUS": status_gen, "SUBSTATUS": substatus_gen, "OBSERVACAO": obs_gen,
-            "DADOS_BILLING": f"NOME: {nome_base} | DOC: {doc_num or doc_raw} | CEP: {cep_raw} | CIDADE: {cidade_base} | UF: {uf_base} | IE: {ie_base or '-'}",
+            "DADOS_BILLING": f"NOME: {nome_base} | DOC: {doc_num} | CEP: {cep_raw} | CIDADE: {cidade_base} | UF: {uf_base} | IE: {ie_base or '-'}",
             "DADOS_CONTRATO": None, "DADOS_TABELA_VERDADE": None,
             "ID_LOTE": lote, "PRODUTO": produto, "TIPO_SERVICO": tipo_svc,
             "DESCRICAO_SERVICO": desc_svc, "TIPO_IMPOSTO": imposto,
             "PROMOCAO": promo or None, "GRUPO_LOCALIDADE": grupo, "CRM": crm,
         })
         print(f"— CEP GENÉRICO | {status_gen} | {loc_str}")
+        if delay: time.sleep(delay)
         continue
 
     # --- Documento inválido ---
@@ -472,25 +471,27 @@ for i, row in df.iterrows():
     uf_ok         = not uf_base or not uf_rec or _normalizar(uf_base) == uf_rec
     cep_ok        = cep_raw == cep_receita
 
+    mun_receita = _normalizar(receita.get("receita_municipio", ""))
+    mun_base    = _normalizar(cidade_base_limpa)
+
     divergencias = []
-    if _cep_generico(cep_receita):
-        try:
-            end_gen_rec  = consultar_cep(cep_receita)
-            cidade_gen_r = _normalizar(end_gen_rec.get("Cidade", ""))
-            loc_gen_r    = f"{end_gen_rec.get('Cidade','')}/{end_gen_rec.get('UF','')}"
-            loc_ok_rec   = bool(cidade_gen_r) and cidade_gen_r == _normalizar(receita.get("receita_municipio",""))
-        except Exception:
-            loc_ok_rec = False
-            loc_gen_r  = "não identificada"
-        if not loc_ok_rec:
-            divergencias.append(
-                f"[CEP] CEP da Receita é genérico: {cep_receita[:5]}-{cep_receita[5:]} | "
-                f"Localidade divergente: Receita '{receita.get('receita_municipio','')}' x CEP '{loc_gen_r}'"
-            )
+    # CEP base genérico para CNPJ: compara município da base com receita_municipio
+    if _cep_generico(cep_raw):
+        nota_gen_b = f"[CEP] CEP da base é genérico: {cep_raw[:5]}-{cep_raw[5:]} (representa sede do município)"
+        if mun_receita and mun_receita == mun_base:
+            divergencias.append(f"{nota_gen_b} | Município confirmado: {receita.get('receita_municipio','')}")
         else:
             divergencias.append(
-                f"[CEP] CEP da Receita é genérico: {cep_receita[:5]}-{cep_receita[5:]} | "
-                f"Localidade confirmada: {loc_gen_r}"
+                f"{nota_gen_b} | Município divergente: base '{cidade_base_limpa}' x Receita '{receita.get('receita_municipio','')}'"
+            )
+    # CEP da Receita genérico: compara município da Receita com município da base
+    if _cep_generico(cep_receita):
+        nota_gen_r = f"[CEP] CEP da Receita é genérico: {cep_receita[:5]}-{cep_receita[5:]} (sede do município)"
+        if mun_receita and mun_receita == mun_base:
+            divergencias.append(f"{nota_gen_r} | Município confirmado: {receita.get('receita_municipio','')}")
+        else:
+            divergencias.append(
+                f"{nota_gen_r} | Município divergente: base '{cidade_base_limpa}' x Receita '{receita.get('receita_municipio','')}'"
             )
     if not cep_ok:
         divergencias.append(f"CEP divergente: base '{cep_raw}' x Receita '{cep_receita}'")

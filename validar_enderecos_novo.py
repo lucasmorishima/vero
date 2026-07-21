@@ -63,6 +63,7 @@ LEFT JOIN hive_metastore.accenture.tb_dispersao_competencia_analitica ca
         (bc.crm <> 'NG' AND ca.CONTRATO = bc.idcontrato)
     )
 WHERE bc.crm = 'NG'
+  AND ca.CPF_CNPJ IS NOT NULL
 LIMIT 100
 """
 

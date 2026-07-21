@@ -80,6 +80,7 @@ LEFT JOIN hive_metastore.accenture.tb_dispersao_competencia_analitica ca
         (bc.crm <> 'NG' AND ca.CONTRATO = bc.idcontrato)
     )
 WHERE bc.crm = 'NG'
+  AND ca.CPF_CNPJ IS NOT NULL
 LIMIT 100
 """
 
@@ -524,6 +525,20 @@ from pyspark.sql.types import (
 
 CATALOG = "hive_metastore.accenture"
 
+# Remove NOT NULL constraints de colunas que podem ser nulas entre tabelas
+for _tbl, _col in [
+    ("validacao_status_fatura",      "CRM"),
+    ("validacao_enderecos",          "CRM"),
+    ("validacao_dados_cadastrais",   "CRM"),
+]:
+    try:
+        spark.sql(f"ALTER TABLE {CATALOG}.{_tbl} ALTER COLUMN {_col} DROP NOT NULL")
+        print(f"✓ NOT NULL removido: {_tbl}.{_col}")
+    except Exception:
+        pass  # Tabela ainda não existe ou constraint já não existe
+
+# COMMAND ----------
+
 # Schema explícito para validacao_dados_cadastrais
 _SCHEMA_CADASTRAIS = {
     "CNAE_Principal_Codigo": LongType(),
@@ -571,19 +586,22 @@ def _to_spark(linhas: list[dict], tipos: dict | None = None):
 # validacao_enderecos
 if linhas_validacao:
     _to_spark(linhas_validacao) \
-        .write.mode("append").saveAsTable(f"{CATALOG}.validacao_enderecos")
+        .write.mode("append").option("mergeSchema", "true") \
+        .saveAsTable(f"{CATALOG}.validacao_enderecos")
     print(f"✓ {len(linhas_validacao)} registros → {CATALOG}.validacao_enderecos")
 
 # validacao_dados_cadastrais
 if linhas_cadastrais:
     _to_spark(linhas_cadastrais, tipos=_SCHEMA_CADASTRAIS) \
-        .write.mode("append").saveAsTable(f"{CATALOG}.validacao_dados_cadastrais")
+        .write.mode("append").option("mergeSchema", "true") \
+        .saveAsTable(f"{CATALOG}.validacao_dados_cadastrais")
     print(f"✓ {len(linhas_cadastrais)} registros → {CATALOG}.validacao_dados_cadastrais")
 
 # validacao_status_fatura
 if linhas_relatorio:
     _to_spark(linhas_relatorio) \
-        .write.mode("append").saveAsTable(f"{CATALOG}.validacao_status_fatura")
+        .write.mode("append").option("mergeSchema", "true") \
+        .saveAsTable(f"{CATALOG}.validacao_status_fatura")
     print(f"✓ {len(linhas_relatorio)} registros → {CATALOG}.validacao_status_fatura")
 
 # COMMAND ----------

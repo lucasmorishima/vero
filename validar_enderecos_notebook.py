@@ -316,23 +316,45 @@ for i, row in df.iterrows():
 
     print(f"  [{int(i)+1:4d}/{total}] {doc_raw[:18]:<20} ({tipo}) ", end="", flush=True)
 
-    # --- CEP genérico ---
+    # --- CEP genérico: valida localidade antes de decidir status ---
     if _cep_generico(cep_raw):
-        obs = (f"[CEP] CEP genérico não aceito: {cep_raw[:5]}-{cep_raw[5:]}"
-               f" (representa sede do município, não um endereço específico)")
+        try:
+            end_gen    = consultar_cep(cep_raw)
+            cidade_gen = _normalizar(end_gen.get("Cidade", ""))
+            uf_gen     = _normalizar(end_gen.get("UF", ""))
+            loc_str    = f"{end_gen.get('Cidade','')}/{end_gen.get('UF','')}"
+            cidade_ok_gen = bool(cidade_gen) and _normalizar(cidade_base_limpa) == cidade_gen
+            uf_ok_gen     = not uf_base or not uf_gen or _normalizar(uf_base) == uf_gen
+        except Exception:
+            cidade_ok_gen = False
+            uf_ok_gen     = False
+            loc_str       = "não identificada"
+
+        nota_gen = f"[CEP] CEP genérico: {cep_raw[:5]}-{cep_raw[5:]} (representa sede do município)"
+        if cidade_ok_gen and uf_ok_gen:
+            obs_gen        = f"{nota_gen} | Localidade confirmada: {loc_str}"
+            status_gen     = "CORRETO"
+            substatus_gen  = "ALERTA"
+            status_val_gen = "CEP genérico - localidade confirmada"
+        else:
+            obs_gen        = f"{nota_gen} | Localidade divergente: base '{cidade_base_limpa}/{uf_base}' x CEP '{loc_str}'"
+            status_gen     = "INCORRETO"
+            substatus_gen  = "ERRO"
+            status_val_gen = "CEP genérico - localidade divergente"
+
         linhas_validacao.append({**prefixo, "Documento": doc_num or doc_raw,
                                   "Tipo": tipo, "CEP_Informado": cep_raw,
-                                  "Status_Validacao": "CEP genérico", "Observacao": obs})
+                                  "Status_Validacao": status_val_gen, "Observacao": obs_gen})
         linhas_relatorio.append({
             "FATURA": fatura, "ID_CONTA_CONTRATO": id_cli, "REGRA": regra, "SEGMENTO": segmento,
-            "STATUS": "INCORRETO", "SUBSTATUS": "ERRO", "OBSERVACAO": obs,
+            "STATUS": status_gen, "SUBSTATUS": substatus_gen, "OBSERVACAO": obs_gen,
             "DADOS_BILLING": f"NOME: {nome_base} | DOC: {doc_num or doc_raw} | CEP: {cep_raw} | CIDADE: {cidade_base} | UF: {uf_base} | IE: {ie_base or '-'}",
             "DADOS_CONTRATO": None, "DADOS_TABELA_VERDADE": None,
             "ID_LOTE": lote, "PRODUTO": produto, "TIPO_SERVICO": tipo_svc,
             "DESCRICAO_SERVICO": desc_svc, "TIPO_IMPOSTO": imposto,
-            "PROMOCAO": promo or None, "GRUPO_LOCALIDADE": grupo,
+            "PROMOCAO": promo or None, "GRUPO_LOCALIDADE": grupo, "CRM": crm,
         })
-        print(f"— CEP GENÉRICO REJEITADO ({cep_raw[:5]}-{cep_raw[5:]})")
+        print(f"— CEP GENÉRICO | {status_gen} | {loc_str}")
         continue
 
     # --- Documento inválido ---
@@ -355,22 +377,49 @@ for i, row in df.iterrows():
     if tipo == "CPF":
         try:
             end = consultar_cep(cep_raw)
+
+            # Compara base interna com Correios
+            cidade_cor = _normalizar(end.get("Cidade", ""))
+            uf_cor     = _normalizar(end.get("UF", ""))
+            cidade_ok  = not cidade_base_limpa or not cidade_cor or _normalizar(cidade_base_limpa) == cidade_cor
+            uf_ok      = not uf_base or not uf_cor or _normalizar(uf_base) == uf_cor
+
+            divs_cpf = []
+            if not cidade_ok:
+                divs_cpf.append(f"Cidade divergente: base '{cidade_base_limpa}' x Correios '{end.get('Cidade','')}'")
+            if not uf_ok:
+                divs_cpf.append(f"UF divergente: base '{uf_base}' x Correios '{end.get('UF','')}'")
+
+            obs_cpf        = " | ".join(divs_cpf)
+            status_cpf     = "INCORRETO" if divs_cpf else "CORRETO"
+            substatus_cpf  = "ERRO" if divs_cpf else "OK"
+            status_val_cpf = "Divergente" if divs_cpf else "Confere"
+
+            dados_tabela_verdade_cpf = (
+                f"CEP: {cep_raw} | LOGRADOURO: {end.get('Logradouro','')} | BAIRRO: {end.get('Bairro','')} | CIDADE: {end.get('Cidade','')} | UF: {end.get('UF','')}"
+            )
+
             linhas_validacao.append({**prefixo, "Documento": doc_num, "Tipo": "CPF",
                                       "CEP_Informado": cep_raw,
                                       "Logradouro": end.get("Logradouro",""), "Bairro": end.get("Bairro",""),
                                       "Cidade": end.get("Cidade",""), "UF": end.get("UF",""),
                                       "Complemento": end.get("Complemento",""),
-                                      "Fonte_CEP": end.get("Fonte_CEP",""), "Status_Validacao": "CEP encontrado"})
+                                      "Cidade_Confere": "Sim" if cidade_ok else "Não",
+                                      "UF_Confere": "Sim" if uf_ok else "Não",
+                                      "Fonte_CEP": end.get("Fonte_CEP",""),
+                                      "Status_Validacao": status_val_cpf,
+                                      "Observacao": obs_cpf})
             linhas_relatorio.append({
                 "FATURA": fatura, "ID_CONTA_CONTRATO": id_cli, "REGRA": regra, "SEGMENTO": segmento,
-                "STATUS": "CORRETO", "SUBSTATUS": "OK", "OBSERVACAO": "",
+                "STATUS": status_cpf, "SUBSTATUS": substatus_cpf, "OBSERVACAO": obs_cpf,
                 "DADOS_BILLING": f"NOME: {nome_base} | DOC: {doc_num} | CEP: {cep_raw} | CIDADE: {cidade_base} | UF: {uf_base} | IE: {ie_base or '-'}",
-                "DADOS_CONTRATO": None, "DADOS_TABELA_VERDADE": None,
+                "DADOS_CONTRATO": None,
+                "DADOS_TABELA_VERDADE": dados_tabela_verdade_cpf,
                 "ID_LOTE": lote, "PRODUTO": produto, "TIPO_SERVICO": tipo_svc,
                 "DESCRICAO_SERVICO": desc_svc, "TIPO_IMPOSTO": imposto,
                 "PROMOCAO": promo or None, "GRUPO_LOCALIDADE": grupo, "CRM": crm,
             })
-            print(f"— {end.get('Logradouro','')[:35]}, {end.get('Cidade','')}/{end.get('UF','')}")
+            print(f"— {status_val_cpf} | {end.get('Logradouro','')[:30]}, {end.get('Cidade','')}/{end.get('UF','')}")
         except Exception as exc:
             linhas_validacao.append({**prefixo, "Documento": doc_num, "Tipo": "CPF",
                                       "CEP_Informado": cep_raw, "Status_Validacao": f"Erro CEP: {exc}"})
@@ -425,7 +474,24 @@ for i, row in df.iterrows():
 
     divergencias = []
     if _cep_generico(cep_receita):
-        divergencias.append(f"[CEP] CEP da Receita é genérico: {cep_receita[:5]}-{cep_receita[5:]} (sede do município)")
+        try:
+            end_gen_rec  = consultar_cep(cep_receita)
+            cidade_gen_r = _normalizar(end_gen_rec.get("Cidade", ""))
+            loc_gen_r    = f"{end_gen_rec.get('Cidade','')}/{end_gen_rec.get('UF','')}"
+            loc_ok_rec   = bool(cidade_gen_r) and cidade_gen_r == _normalizar(receita.get("receita_municipio",""))
+        except Exception:
+            loc_ok_rec = False
+            loc_gen_r  = "não identificada"
+        if not loc_ok_rec:
+            divergencias.append(
+                f"[CEP] CEP da Receita é genérico: {cep_receita[:5]}-{cep_receita[5:]} | "
+                f"Localidade divergente: Receita '{receita.get('receita_municipio','')}' x CEP '{loc_gen_r}'"
+            )
+        else:
+            divergencias.append(
+                f"[CEP] CEP da Receita é genérico: {cep_receita[:5]}-{cep_receita[5:]} | "
+                f"Localidade confirmada: {loc_gen_r}"
+            )
     if not cep_ok:
         divergencias.append(f"CEP divergente: base '{cep_raw}' x Receita '{cep_receita}'")
     if not cidade_ok:

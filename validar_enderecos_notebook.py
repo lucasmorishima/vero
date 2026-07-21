@@ -70,7 +70,8 @@ SELECT
     ''                                                         AS TIPO_IMPOSTO,
     ''                                                         AS PROMOCAO,
     ''                                                         AS GRUPO_LOCALIDADE,
-    date_format(current_date(), 'yyyy_MM')                     AS ID_LOTE
+    date_format(current_date(), 'yyyy_MM')                     AS ID_LOTE,
+    ca.sistema_origem                                          AS CRM
 FROM hive_metastore.accenture.base_clientes_centralizada bc
 LEFT JOIN hive_metastore.accenture.tb_dispersao_competencia_analitica ca
     ON (
@@ -78,7 +79,7 @@ LEFT JOIN hive_metastore.accenture.tb_dispersao_competencia_analitica ca
         OR
         (bc.crm <> 'NG' AND ca.CONTRATO = bc.idcontrato)
     )
-WHERE bc.crm = 'AN'
+WHERE bc.crm = 'NG'
 LIMIT 100
 """
 
@@ -262,6 +263,7 @@ col_promo   = _encontrar_coluna(df, ["PROMOCAO"])
 col_grupo   = _encontrar_coluna(df, ["GRUPO_LOCALIDADE"])
 col_lote    = _encontrar_coluna(df, ["ID_LOTE"])
 col_seg     = _encontrar_coluna(df, ["SEGMENTO"])
+col_crm     = _encontrar_coluna(df, ["CRM", "SISTEMA_ORIGEM"])
 
 total = len(df)
 fonte_cep = "Correios API" if TOKEN else "ViaCEP"
@@ -298,6 +300,7 @@ for i, row in df.iterrows():
     grupo       = _val(col_grupo)
     lote        = _val(col_lote)
     segmento    = _val(col_seg)
+    crm         = _val(col_crm)
 
     cidade_base_limpa = re.sub(r"\s*-\s*\w+$", "", cidade_base).strip()
 
@@ -307,6 +310,7 @@ for i, row in df.iterrows():
         "Nome_Cliente_Base": nome_base, "IE_Base": ie_base,
         "Produto": produto, "Tipo_Servico": tipo_svc, "Descricao_Servico": desc_svc,
         "Tipo_Imposto": imposto, "Promocao": promo, "Grupo_Localidade": grupo, "ID_Lote": lote,
+        "CRM": crm,
     }
 
     print(f"  [{int(i)+1:4d}/{total}] {doc_raw[:18]:<20} ({tipo}) ", end="", flush=True)
@@ -363,7 +367,7 @@ for i, row in df.iterrows():
                 "DADOS_CONTRATO": None, "DADOS_TABELA_VERDADE": None,
                 "ID_LOTE": lote, "PRODUTO": produto, "TIPO_SERVICO": tipo_svc,
                 "DESCRICAO_SERVICO": desc_svc, "TIPO_IMPOSTO": imposto,
-                "PROMOCAO": promo or None, "GRUPO_LOCALIDADE": grupo,
+                "PROMOCAO": promo or None, "GRUPO_LOCALIDADE": grupo, "CRM": crm,
             })
             print(f"— {end.get('Logradouro','')[:35]}, {end.get('Cidade','')}/{end.get('UF','')}")
         except Exception as exc:
@@ -377,7 +381,7 @@ for i, row in df.iterrows():
                 "DADOS_CONTRATO": None, "DADOS_TABELA_VERDADE": None,
                 "ID_LOTE": lote, "PRODUTO": produto, "TIPO_SERVICO": tipo_svc,
                 "DESCRICAO_SERVICO": desc_svc, "TIPO_IMPOSTO": imposto,
-                "PROMOCAO": promo or None, "GRUPO_LOCALIDADE": grupo,
+                "PROMOCAO": promo or None, "GRUPO_LOCALIDADE": grupo, "CRM": crm,
             })
             print(f"— ERRO CEP: {exc}")
         if delay: time.sleep(delay)
@@ -514,12 +518,55 @@ print(f"\nConcluído: {ok} OK | {div} divergente(s) | {erro} erro(s)")
 
 # COMMAND ----------
 
+from pyspark.sql.types import (
+    StructType, StructField, StringType, LongType, DoubleType, BooleanType
+)
+
 CATALOG = "hive_metastore.accenture"
 
-def _to_spark(linhas: list[dict]):
-    """Converte lista de dicts para Spark DataFrame garantindo que NaN vire NULL (não a string 'nan')."""
-    df_pd = pd.DataFrame(linhas).astype(str).replace("nan", None)
-    return spark.createDataFrame(df_pd)
+# Schema explícito para validacao_dados_cadastrais
+_SCHEMA_CADASTRAIS = {
+    "CNAE_Principal_Codigo": LongType(),
+    "Capital_Social":        DoubleType(),
+    "Simples_Nacional":      BooleanType(),
+    "MEI":                   BooleanType(),
+}
+
+_VAZIOS = {"", "nan", "NaN", "None", "none", "null", "NULL", "NaT", "na", "NA"}
+
+def _to_spark(linhas: list[dict], tipos: dict | None = None):
+    """Converte lista de dicts para Spark DataFrame com schema explícito.
+    Qualquer valor vazio/nulo (None, NaN, '', 'null', 'nan', etc.) vira NULL no Spark."""
+    df_pd = pd.DataFrame(linhas)
+    tipos = tipos or {}
+
+    for col in df_pd.columns:
+        spark_type = tipos.get(col)
+
+        if isinstance(spark_type, LongType):
+            df_pd[col] = pd.to_numeric(df_pd[col], errors="coerce") \
+                           .apply(lambda x: int(x) if pd.notna(x) else None)
+
+        elif isinstance(spark_type, DoubleType):
+            df_pd[col] = pd.to_numeric(df_pd[col], errors="coerce") \
+                           .apply(lambda x: float(x) if pd.notna(x) else None)
+
+        elif isinstance(spark_type, BooleanType):
+            df_pd[col] = df_pd[col].apply(
+                lambda x: None if (x is None or str(x).lower() in _VAZIOS)
+                          else str(x).lower() not in ("false", "0")
+            )
+
+        else:  # StringType — normaliza todos os vazios para None → NULL
+            df_pd[col] = df_pd[col].astype(str).apply(
+                lambda x: None if x in _VAZIOS else x
+            )
+
+    schema = StructType([
+        StructField(c, tipos.get(c, StringType()), True)
+        for c in df_pd.columns
+    ])
+    return spark.createDataFrame(df_pd, schema=schema)
 
 # validacao_enderecos
 if linhas_validacao:
@@ -529,7 +576,7 @@ if linhas_validacao:
 
 # validacao_dados_cadastrais
 if linhas_cadastrais:
-    _to_spark(linhas_cadastrais) \
+    _to_spark(linhas_cadastrais, tipos=_SCHEMA_CADASTRAIS) \
         .write.mode("append").saveAsTable(f"{CATALOG}.validacao_dados_cadastrais")
     print(f"✓ {len(linhas_cadastrais)} registros → {CATALOG}.validacao_dados_cadastrais")
 

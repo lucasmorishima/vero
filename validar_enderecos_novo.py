@@ -53,7 +53,8 @@ SELECT
     ''                                                         AS TIPO_IMPOSTO,
     ''                                                         AS PROMOCAO,
     ''                                                         AS GRUPO_LOCALIDADE,
-    date_format(current_date(), 'yyyy_MM')                     AS ID_LOTE
+    date_format(current_date(), 'yyyy_MM')                     AS ID_LOTE,
+    ca.sistema_origem                                          AS CRM
 FROM hive_metastore.accenture.base_clientes_centralizada bc
 LEFT JOIN hive_metastore.accenture.tb_dispersao_competencia_analitica ca
     ON (
@@ -61,7 +62,7 @@ LEFT JOIN hive_metastore.accenture.tb_dispersao_competencia_analitica ca
         OR
         (bc.crm <> 'NG' AND ca.CONTRATO = bc.idcontrato)
     )
-WHERE bc.crm = 'AN'
+WHERE bc.crm = 'NG'
 LIMIT 100
 """
 

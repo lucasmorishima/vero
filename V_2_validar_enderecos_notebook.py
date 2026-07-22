@@ -230,6 +230,7 @@ def _consultar_receita_api(cnpj: str) -> dict:
     try:
         with _brasilapi_sem:
             resp = session.get(url, timeout=20)
+            time.sleep(0.35)   # throttle: ~3 req/s máximo para evitar 429
         if resp.status_code != 200:
             return {"cnpj": cnpj, "data_consulta": data_consulta,
                     "status_consulta": f"erro_http_{resp.status_code}"}
@@ -300,16 +301,37 @@ def _limpar_rec_receita(r: dict) -> dict:
     return limpo
 
 
-# --- Coleta todos os CNPJs da base-fonte (sem limite) ---
-cnpjs_lote: set[str] = {
-    r["cnpj_limpo"]
-    for r in spark.sql("""
-        SELECT DISTINCT REGEXP_REPLACE(ca.CPF_CNPJ, '[^0-9]', '') AS cnpj_limpo
-        FROM hive_metastore.accenture.tb_dispersao_competencia_analitica ca
-        WHERE ca.CPF_CNPJ IS NOT NULL
-          AND LENGTH(REGEXP_REPLACE(ca.CPF_CNPJ, '[^0-9]', '')) = 14
-    """).collect()
-}
+# Inicializa caches — garante que as variáveis existam mesmo se a célula falhar parcialmente
+_cache_receita: dict[str, dict] = {}
+_cep_cache:     dict[str, dict] = {}
+
+
+def _cnpj_valido(cnpj: str) -> bool:
+    """Valida CNPJ pelo algoritmo dos dígitos verificadores."""
+    if len(cnpj) != 14 or cnpj == cnpj[0] * 14:
+        return False
+    for pesos, pos in (([5,4,3,2,9,8,7,6,5,4,3,2], 12), ([6,5,4,3,2,9,8,7,6,5,4,3,2], 13)):
+        soma = sum(int(cnpj[i]) * pesos[i] for i in range(pos))
+        resto = soma % 11
+        dv = 0 if resto < 2 else 11 - resto
+        if dv != int(cnpj[pos]):
+            return False
+    return True
+
+
+# --- Coleta CNPJs do lote atual (resultado da query com LIMIT_REGISTROS) ---
+_col_doc_raw = next((c for c in df.columns if c.upper() in ("CPF_CNPJ", "CPF/CNPJ", "DOCUMENTO", "CNPJ")), None)
+_cnpjs_raw: set[str] = set()
+if _col_doc_raw:
+    for v in df[_col_doc_raw]:
+        d = re.sub(r"\D", "", str(v).strip())
+        if len(d) == 14:
+            _cnpjs_raw.add(d)
+
+cnpjs_lote: set[str] = {c for c in _cnpjs_raw if _cnpj_valido(c)}
+invalidos   = len(_cnpjs_raw) - len(cnpjs_lote)
+if invalidos:
+    print(f"  {invalidos} CNPJ(s) com dígito verificador inválido ignorados.")
 
 ja_ok: set[str] = {
     r["cnpj"]
@@ -319,7 +341,7 @@ ja_ok: set[str] = {
 }
 
 cnpjs_buscar = sorted(cnpjs_lote - ja_ok)
-print(f"CNPJs na base-fonte: {len(cnpjs_lote)} | Já na tabela (ok): {len(ja_ok)} | A buscar na API: {len(cnpjs_buscar)}")
+print(f"CNPJs na base-fonte: {len(_cnpjs_raw)} | Válidos: {len(cnpjs_lote)} | Já na tabela (ok): {len(ja_ok)} | A buscar na API: {len(cnpjs_buscar)}")
 
 # --- Busca somente os CNPJs novos / com erro anterior ---
 if cnpjs_buscar:
@@ -421,18 +443,13 @@ def _buscar_cep_api(cep: str) -> dict:
                 "status_consulta": f"erro_rede: {str(exc)[:120]}"}
 
 
-# Coleta todos os CEPs da base-fonte (sem limite) + endereços da Receita já carregados
+# Coleta CEPs do lote atual (colunas de instalação e legal presentes no df)
 ceps_lote: set[str] = set()
-
-for r in spark.sql("""
-    SELECT DISTINCT REGEXP_REPLACE(bc.cep, '[^0-9]', '') AS cep_limpo
-    FROM hive_metastore.accenture.base_clientes_centralizada bc
-    WHERE bc.cep IS NOT NULL
-      AND LENGTH(REGEXP_REPLACE(bc.cep, '[^0-9]', '')) = 8
-""").collect():
-    cep = r["cep_limpo"].zfill(8)
-    if cep != "00000000":
-        ceps_lote.add(cep)
+for col_cep_col in [c for c in df.columns if "cep" in c.lower()]:
+    for v in df[col_cep_col]:
+        cep = re.sub(r"\D", "", str(v)).zfill(8)
+        if len(cep) == 8 and cep != "00000000":
+            ceps_lote.add(cep)
 
 for rec in _cache_receita.values():
     cep = (rec.get("receita_cep") or "").replace("-", "").strip().zfill(8)

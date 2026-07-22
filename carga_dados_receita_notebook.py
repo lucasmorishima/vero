@@ -83,9 +83,23 @@ WHERE ca.CPF_CNPJ IS NOT NULL
   AND LENGTH(REGEXP_REPLACE(ca.CPF_CNPJ, '[^0-9]', '')) = 14
 """
 
-df_cnpjs = spark.sql(_QUERY_CNPJS)
-todos_cnpjs: set[str] = {r["cnpj_limpo"] for r in df_cnpjs.collect()}
-print(f"{len(todos_cnpjs)} CNPJs únicos encontrados na base.")
+def _cnpj_valido(cnpj: str) -> bool:
+    """Valida CNPJ pelo algoritmo dos dígitos verificadores."""
+    if len(cnpj) != 14 or cnpj == cnpj[0] * 14:
+        return False
+    for pesos, pos in (([5,4,3,2,9,8,7,6,5,4,3,2], 12), ([6,5,4,3,2,9,8,7,6,5,4,3,2], 13)):
+        soma = sum(int(cnpj[i]) * pesos[i] for i in range(pos))
+        resto = soma % 11
+        dv = 0 if resto < 2 else 11 - resto
+        if dv != int(cnpj[pos]):
+            return False
+    return True
+
+
+_cnpjs_raw: set[str] = {r["cnpj_limpo"] for r in spark.sql(_QUERY_CNPJS).collect()}
+todos_cnpjs: set[str] = {c for c in _cnpjs_raw if _cnpj_valido(c)}
+invalidos = len(_cnpjs_raw) - len(todos_cnpjs)
+print(f"{len(_cnpjs_raw)} CNPJs únicos na base | {invalidos} inválidos (DV) ignorados | {len(todos_cnpjs)} válidos a processar.")
 
 # COMMAND ----------
 
@@ -144,6 +158,7 @@ def consultar_receita(cnpj: str) -> dict[str, Any]:
     try:
         with _brasilapi_sem:
             resp = session.get(url, timeout=TIMEOUT_SEG)
+            time.sleep(0.35)   # throttle: ~3 req/s máximo para evitar 429
 
         if resp.status_code != 200:
             return {

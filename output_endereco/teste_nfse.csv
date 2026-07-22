@@ -1,0 +1,11 @@
+﻿codigo_ibge,municipio,uf,codigo_trecho,nome_trecho,nome_contrato,aliquota,aliquota_efetiva,percentual,extensao,inicio_vigencia,fim_vigencia,situacao,fonte,data_consulta,status,detalhe,json_retorno
+4106902,Curitiba,PR,,,,,,,,,,,NFS-e Via,2026-07-21T21:24:46,sem_certificado,Certificado mTLS ICP-Brasil obrigatório (HTTP 496),
+4314902,Porto Alegre,RS,,,,,,,,,,,NFS-e Via,2026-07-21T21:24:46,sem_certificado,Certificado mTLS ICP-Brasil obrigatório (HTTP 496),
+3304557,Rio de Janeiro,RJ,,,,,,,,,,,NFS-e Via,2026-07-21T21:24:46,sem_certificado,Certificado mTLS ICP-Brasil obrigatório (HTTP 496),
+3106200,Belo Horizonte,MG,,,,,,,,,,,NFS-e Via,2026-07-21T21:24:46,sem_certificado,Certificado mTLS ICP-Brasil obrigatório (HTTP 496),
+3550308,São Paulo,SP,,,,,,,,,,,NFS-e Via,2026-07-21T21:24:46,sem_certificado,Certificado mTLS ICP-Brasil obrigatório (HTTP 496),
+2927408,Salvador,BA,,,,,,,,,,,NFS-e Via,2026-07-21T21:24:46,sem_certificado,Certificado mTLS ICP-Brasil obrigatório (HTTP 496),
+2304400,Fortaleza,CE,,,,,,,,,,,NFS-e Via,2026-07-21T21:24:46,sem_certificado,Certificado mTLS ICP-Brasil obrigatório (HTTP 496),
+2611606,Recife,PE,,,,,,,,,,,NFS-e Via,2026-07-21T21:24:46,sem_certificado,Certificado mTLS ICP-Brasil obrigatório (HTTP 496),
+1302603,Manaus,AM,,,,,,,,,,,NFS-e Via,2026-07-21T21:24:46,sem_certificado,Certificado mTLS ICP-Brasil obrigatório (HTTP 496),
+5300108,Brasília,DF,,,,,,,,,,,NFS-e Via,2026-07-21T21:24:46,sem_certificado,Certificado mTLS ICP-Brasil obrigatório (HTTP 496),

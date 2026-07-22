@@ -177,7 +177,16 @@ if LIMIT_REGISTROS:
     _QUERY += f"LIMIT {LIMIT_REGISTROS}"
 
 df = spark.sql(_QUERY).toPandas().astype(str)
-print(f"{len(df)} registros carregados.")
+
+_col_doc_diag = next((c for c in df.columns if c.upper() in ("CPF_CNPJ", "DOCUMENTO")), None)
+if _col_doc_diag:
+    _n_cnpj = sum(1 for v in df[_col_doc_diag] if len(re.sub(r"\D","",str(v))) == 14)
+    _n_cpf  = sum(1 for v in df[_col_doc_diag] if len(re.sub(r"\D","",str(v))) == 11)
+    print(f"{len(df)} registros carregados — CPF: {_n_cpf} | CNPJ: {_n_cnpj}")
+    if _n_cnpj == 0:
+        print("  AVISO: nenhum CNPJ no lote — DADOS_CADASTRAIS não será gerado. Verifique o ORDER BY ou LIMIT_REGISTROS.")
+else:
+    print(f"{len(df)} registros carregados.")
 display(df.head())
 
 # COMMAND ----------
@@ -664,10 +673,13 @@ def _val_dados_cadastrais(base: dict, doc_num: str, receita: dict | None, nome_b
 
     if receita is None:
         obs = "[CACHE] CNPJ não encontrado em tab_dados_receita. Execute a célula de populate."
+        linha_cad_vazio = {**base, "REGRA": regra, "CNPJ": doc_num,
+                           "Situacao_Cadastral": "NAO_CARREGADO",
+                           "Data_Consulta_Receita": None}
         return (
             {**base, "REGRA": regra, "Documento": doc_num, "Tipo": "CNPJ",
              "Status_Validacao": "nao_carregado", "Observacao": obs},
-            None,
+            linha_cad_vazio,
             _rel_base(base, regra, "PENDENTE", "CACHE_VAZIO", obs, billing, None, None),
             f"{regra} — NÃO CARREGADO NO CACHE",
         )
@@ -902,17 +914,19 @@ def _processar_linha(args: tuple) -> tuple:
     receita = _cache_receita.get(doc_num) if tipo == "CNPJ" else None
     results = []
 
-    # 1. DADOS CADASTRAIS — somente CNPJ
     if tipo == "CNPJ":
+        # 1. DADOS CADASTRAIS — somente CNPJ
         results.append(_val_dados_cadastrais(base, doc_num, receita, nome_base))
-
-    # 2. ENDEREÇO LEGAL — CPF e CNPJ
-    results.append(_val_endereco_legal(base, tipo, doc_num, cep_legal,
-                                       cidade_legal, uf_legal, nome_base, ie_base, receita))
-
-    # 3. ENDEREÇO DE INSTALAÇÃO — CPF e CNPJ (sem cruzar com Receita)
-    results.append(_val_endereco_instalacao(base, tipo, doc_num, cep_inst,
-                                            cidade_inst, uf_inst, nome_base, ie_base))
+        # 2. ENDEREÇO LEGAL — somente CNPJ: CEP + Receita
+        results.append(_val_endereco_legal(base, tipo, doc_num, cep_legal,
+                                           cidade_legal, uf_legal, nome_base, ie_base, receita))
+        # 3. ENDEREÇO DE INSTALAÇÃO — somente CNPJ
+        results.append(_val_endereco_instalacao(base, tipo, doc_num, cep_inst,
+                                                cidade_inst, uf_inst, nome_base, ie_base))
+    else:
+        # CPF: somente ENDEREÇO DE INSTALAÇÃO (via CEP)
+        results.append(_val_endereco_instalacao(base, tipo, doc_num, cep_inst,
+                                                cidade_inst, uf_inst, nome_base, ie_base))
 
     return (i, results)
 

@@ -63,6 +63,9 @@ CATALOG        = "hive_metastore.accenture"
 TABELA_RECEITA = f"{CATALOG}.tab_dados_receita"
 TABELA_CEP     = f"{CATALOG}.tab_dados_cep"
 
+# Limite de registros para processar. None = sem limite (processa tudo).
+LIMIT_REGISTROS = None  # ex: 1000 para teste, None para produção
+
 # BrasilAPI: 1 chamada simultânea para evitar 429
 _brasilapi_sem = threading.Semaphore(1)
 
@@ -161,6 +164,9 @@ LEFT JOIN hive_metastore.accenture.tb_dispersao_competencia_analitica ca
 WHERE bc.crm = 'NG'
   AND ca.CPF_CNPJ IS NOT NULL
 """
+
+if LIMIT_REGISTROS:
+    _QUERY += f"LIMIT {LIMIT_REGISTROS}"
 
 df = spark.sql(_QUERY).toPandas().astype(str)
 print(f"{len(df)} registros carregados.")

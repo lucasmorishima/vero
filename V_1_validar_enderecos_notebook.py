@@ -47,6 +47,9 @@ try:
 except Exception:
     TOKEN = ""
 
+# Limite de registros para processar. None = sem limite (processa tudo).
+LIMIT_REGISTROS = None  # ex: 1000 para teste, None para produção
+
 # COMMAND ----------
 
 # MAGIC %md
@@ -84,8 +87,10 @@ LEFT JOIN hive_metastore.accenture.tb_dispersao_competencia_analitica ca
     )
 WHERE bc.crm = 'NG'
   AND ca.CPF_CNPJ IS NOT NULL
-LIMIT 100
 """
+
+if LIMIT_REGISTROS:
+    _QUERY += f"LIMIT {LIMIT_REGISTROS}"
 
 df = spark.sql(_QUERY).toPandas().astype(str)
 print(f"{len(df)} registros carregados.")

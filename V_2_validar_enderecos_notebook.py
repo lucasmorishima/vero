@@ -1002,25 +1002,23 @@ col_map = {
 }
 
 total = len(df)
-print(f"Processando {total} registros | Receita cache={len(_cache_receita)} CNPJs | CEP cache={len(_cep_cache)} CEPs | workers=20\n")
+print(f"Processando {total} registros | Receita cache={len(_cache_receita)} CNPJs | CEP cache={len(_cep_cache)} CEPs\n")
 
-args_list = [(i, row.to_dict(), col_map, total) for i, row in df.iterrows()]
-
-_resultados_raw: dict = {}
-with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-    futures = {executor.submit(_processar_linha, args): args[0] for args in args_list}
-    for future in concurrent.futures.as_completed(futures):
-        idx, lista_resultados = future.result()
-        _resultados_raw[idx] = lista_resultados
+# to_dict('records') é ~20x mais rápido que iterrows() em DataFrames grandes
+_records = df.to_dict("records")
+args_list = [(i, rec, col_map, total) for i, rec in enumerate(_records)]
+del _records  # libera memória imediatamente
 
 linhas_validacao:  list[dict] = []
 linhas_cadastrais: list[dict] = []
 linhas_relatorio:  list[dict] = []
 
 n_cad = n_end_legal = n_end_inst = n_ok = n_div = n_erro = 0
+_LOG_INTERVAL = max(1, total // 20)  # imprime progresso a cada 5%
 
-for idx in sorted(_resultados_raw.keys()):
-    for linha_val, linha_cad, linha_rel, log_msg in _resultados_raw[idx]:
+for args in args_list:
+    idx, lista_resultados = _processar_linha(args)
+    for linha_val, linha_cad, linha_rel, log_msg in lista_resultados:
         if linha_val is not None:
             linhas_validacao.append(linha_val)
             regra = linha_val.get("REGRA", "")
@@ -1037,12 +1035,15 @@ for idx in sorted(_resultados_raw.keys()):
                 n_div += 1
             elif sv not in ("", None):
                 n_erro += 1
+                # só loga linhas com problema
+                if log_msg:
+                    print(log_msg)
         if linha_cad is not None:
             linhas_cadastrais.append(linha_cad)
         if linha_rel is not None:
             linhas_relatorio.append(linha_rel)
-        if log_msg:
-            print(log_msg)
+    if (idx + 1) % _LOG_INTERVAL == 0:
+        print(f"  {idx + 1}/{total} linhas processadas...")
 
 print(
     f"\nConcluído — registros gerados: "

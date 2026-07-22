@@ -135,25 +135,33 @@ print(f"Tabelas prontas: '{TABELA_RECEITA}' | '{TABELA_CEP}'")
 
 _QUERY = """
 SELECT
-    ROW_NUMBER() OVER (ORDER BY bc.codigocliente) + 1          AS FATURA,
-    COALESCE(ca.CONTRATO, ca.ID_CLIENTE)                       AS ID_CLIENTE_CONTRATO,
-    'DADOS CADASTRAIS'                                         AS REGRA,
-    ca.segmento                                                AS SEGMENTO,
-    bc.cidade                                                  AS cidade,
-    bc.bairro                                                  AS bairro,
-    bc.cep                                                     AS cep,
-    bc.uf                                                      AS uf,
-    ca.CPF_CNPJ                                                AS CPF_CNPJ,
-    ca.NOME_CLIENTE                                            AS NOME_CLIENTE,
-    ''                                                         AS INSCRICAO_ESTADUAL,
-    bc.nome_produto                                            AS PRODUTO,
-    ''                                                         AS TIPO_SERVICO,
-    ''                                                         AS DESCRICAO_SERVICO,
-    ''                                                         AS TIPO_IMPOSTO,
-    ''                                                         AS PROMOCAO,
-    ''                                                         AS GRUPO_LOCALIDADE,
-    date_format(current_date(), 'yyyy_MM')                     AS ID_LOTE,
-    ca.sistema_origem                                          AS CRM
+    ROW_NUMBER() OVER (ORDER BY bc.codigocliente) + 1 AS FATURA,
+    COALESCE(ca.CONTRATO, ca.ID_CLIENTE)               AS ID_CLIENTE_CONTRATO,
+    ca.segmento                                        AS SEGMENTO,
+
+    -- Endereço de instalação (onde o serviço está instalado)
+    bc.cidade   AS cidade_instalacao,
+    bc.bairro   AS bairro_instalacao,
+    bc.cep      AS cep_instalacao,
+    bc.uf       AS uf_instalacao,
+
+    -- Endereço legal (endereço de cobrança / cadastro)
+    bc.cidade   AS cidade_legal,
+    bc.bairro   AS bairro_legal,
+    bc.cep      AS cep_legal,
+    bc.uf       AS uf_legal,
+
+    ca.CPF_CNPJ                              AS CPF_CNPJ,
+    ca.NOME_CLIENTE                          AS NOME_CLIENTE,
+    ''                                       AS INSCRICAO_ESTADUAL,
+    bc.nome_produto                          AS PRODUTO,
+    ''                                       AS TIPO_SERVICO,
+    ''                                       AS DESCRICAO_SERVICO,
+    ''                                       AS TIPO_IMPOSTO,
+    ''                                       AS PROMOCAO,
+    ''                                       AS GRUPO_LOCALIDADE,
+    date_format(current_date(), 'yyyy_MM')   AS ID_LOTE,
+    ca.sistema_origem                        AS CRM
 FROM hive_metastore.accenture.base_clientes_centralizada bc
 LEFT JOIN hive_metastore.accenture.tb_dispersao_competencia_analitica ca
     ON (
@@ -292,14 +300,16 @@ def _limpar_rec_receita(r: dict) -> dict:
     return limpo
 
 
-# --- Detecta CNPJs do lote ainda não gravados com status ok ---
-col_doc_raw = next((c for c in df.columns if c.upper() in ("CPF_CNPJ", "CPF/CNPJ", "DOCUMENTO", "CNPJ")), None)
-cnpjs_lote: set[str] = set()
-if col_doc_raw:
-    for v in df[col_doc_raw]:
-        d = re.sub(r"\D", "", str(v).strip())
-        if len(d) == 14:
-            cnpjs_lote.add(d)
+# --- Coleta todos os CNPJs da base-fonte (sem limite) ---
+cnpjs_lote: set[str] = {
+    r["cnpj_limpo"]
+    for r in spark.sql("""
+        SELECT DISTINCT REGEXP_REPLACE(ca.CPF_CNPJ, '[^0-9]', '') AS cnpj_limpo
+        FROM hive_metastore.accenture.tb_dispersao_competencia_analitica ca
+        WHERE ca.CPF_CNPJ IS NOT NULL
+          AND LENGTH(REGEXP_REPLACE(ca.CPF_CNPJ, '[^0-9]', '')) = 14
+    """).collect()
+}
 
 ja_ok: set[str] = {
     r["cnpj"]
@@ -309,7 +319,7 @@ ja_ok: set[str] = {
 }
 
 cnpjs_buscar = sorted(cnpjs_lote - ja_ok)
-print(f"CNPJs no lote: {len(cnpjs_lote)} | Já na tabela (ok): {len(ja_ok)} | A buscar na API: {len(cnpjs_buscar)}")
+print(f"CNPJs na base-fonte: {len(cnpjs_lote)} | Já na tabela (ok): {len(ja_ok)} | A buscar na API: {len(cnpjs_buscar)}")
 
 # --- Busca somente os CNPJs novos / com erro anterior ---
 if cnpjs_buscar:
@@ -411,18 +421,22 @@ def _buscar_cep_api(cep: str) -> dict:
                 "status_consulta": f"erro_rede: {str(exc)[:120]}"}
 
 
-# Coleta todos os CEPs necessários: da base de clientes + dos endereços da Receita
-_col_cep_raw = next((c for c in df.columns if c.upper() == "CEP"), None)
+# Coleta todos os CEPs da base-fonte (sem limite) + endereços da Receita já carregados
 ceps_lote: set[str] = set()
-if _col_cep_raw:
-    for v in df[_col_cep_raw]:
-        cep = re.sub(r"\D", "", str(v)).zfill(8)
-        if len(cep) == 8 and cep not in ("00000000",):
-            ceps_lote.add(cep)
+
+for r in spark.sql("""
+    SELECT DISTINCT REGEXP_REPLACE(bc.cep, '[^0-9]', '') AS cep_limpo
+    FROM hive_metastore.accenture.base_clientes_centralizada bc
+    WHERE bc.cep IS NOT NULL
+      AND LENGTH(REGEXP_REPLACE(bc.cep, '[^0-9]', '')) = 8
+""").collect():
+    cep = r["cep_limpo"].zfill(8)
+    if cep != "00000000":
+        ceps_lote.add(cep)
 
 for rec in _cache_receita.values():
     cep = (rec.get("receita_cep") or "").replace("-", "").strip().zfill(8)
-    if len(cep) == 8 and cep not in ("00000000",):
+    if len(cep) == 8 and cep != "00000000":
         ceps_lote.add(cep)
 
 ja_ok_cep: set[str] = {
@@ -574,339 +588,89 @@ print("Funções carregadas.")
 
 # COMMAND ----------
 
-def _processar_linha(args: tuple) -> tuple:
-    """
-    Processa uma única linha do DataFrame.
-    Para CNPJs: lê dados da Receita do _cache_receita (dict em memória).
-    Para CPFs: consulta apenas ViaCEP.
-    """
-    i, row_dict, col_map, total = args
+# ---------------------------------------------------------------------------
+# Helpers internos dos sub-validadores
+# ---------------------------------------------------------------------------
 
-    col_doc     = col_map["doc"]
-    col_cep     = col_map["cep"]
-    col_fatura  = col_map["fatura"]
-    col_id      = col_map["id"]
-    col_regra   = col_map["regra"]
-    col_cidade  = col_map["cidade"]
-    col_bairro  = col_map["bairro"]
-    col_uf      = col_map["uf"]
-    col_nome    = col_map["nome"]
-    col_ie      = col_map["ie"]
-    col_produto = col_map["produto"]
-    col_tpsvc   = col_map["tpsvc"]
-    col_dssvc   = col_map["dssvc"]
-    col_imposto = col_map["imposto"]
-    col_promo   = col_map["promo"]
-    col_grupo   = col_map["grupo"]
-    col_lote    = col_map["lote"]
-    col_seg     = col_map["seg"]
-    col_crm     = col_map["crm"]
+def _cep_end(cep_raw: str) -> dict:
+    """Lê CEP do _cep_cache. Retorna Status_CEP='ERRO' se ausente."""
+    try:
+        return _consultar_cep_cached(cep_raw)
+    except ValueError:
+        return {"Status_CEP": "ERRO", "Cidade": "", "UF": "", "Logradouro": "", "Bairro": "", "Fonte_CEP": ""}
 
-    def _val(col):
-        v = str(row_dict[col]).strip() if col and col in row_dict else ""
-        return "" if v in ("nan", "None") else v
 
-    doc_raw = str(row_dict[col_doc]).strip()
-    cep_raw = str(row_dict[col_cep]).replace("-", "").replace(".", "").strip().zfill(8)
-    tipo    = tipo_documento(doc_raw)
-    doc_num = _limpar_doc(doc_raw)
+def _check_cidade_uf(cidade_base: str, uf_base: str, end: dict) -> list:
+    divs = []
+    cb = _normalizar(re.sub(r"\s*-\s*\w+$", "", cidade_base).strip())
+    cc = _normalizar(end.get("Cidade", ""))
+    ub = _normalizar(uf_base)
+    uc = _normalizar(end.get("UF", ""))
+    if cb and cc and cb != cc:
+        divs.append(f"Cidade divergente: base '{cidade_base}' x CEP '{end.get('Cidade','')}'")
+    if ub and uc and ub != uc:
+        divs.append(f"UF divergente: base '{uf_base}' x CEP '{end.get('UF','')}'")
+    return divs
 
-    fatura      = _val(col_fatura)
-    id_cli      = _val(col_id)
-    regra       = _val(col_regra)
-    cidade_base = _val(col_cidade)
-    bairro_base = _val(col_bairro)
-    uf_base     = _val(col_uf)
-    nome_base   = _val(col_nome)
-    ie_base     = _val(col_ie)
-    produto     = _val(col_produto)
-    tipo_svc    = _val(col_tpsvc)
-    desc_svc    = _val(col_dssvc)
-    imposto     = _val(col_imposto)
-    promo       = _val(col_promo)
-    grupo       = _val(col_grupo)
-    lote        = _val(col_lote)
-    segmento    = _val(col_seg)
-    crm         = _val(col_crm)
 
-    cidade_base_limpa = re.sub(r"\s*-\s*\w+$", "", cidade_base).strip()
+def _divs_cep_generico(cep_raw: str, cidade_base: str, end: dict) -> list:
+    cidade_limpa = re.sub(r"\s*-\s*\w+$", "", cidade_base).strip()
+    nota = f"[CEP] CEP genérico: {cep_raw[:5]}-{cep_raw[5:]} (sede do município)"
+    if _normalizar(cidade_limpa) and _normalizar(end.get("Cidade","")) \
+            and _normalizar(cidade_limpa) != _normalizar(end.get("Cidade","")):
+        return [f"{nota} | Município divergente: base '{cidade_limpa}' x CEP '{end.get('Cidade','')}'"]
+    return [f"{nota} | Município confirmado: {end.get('Cidade','')}/{end.get('UF','')}"]
 
-    prefixo = {
-        "Fatura":               fatura,
-        "ID_Cliente":           id_cli,
-        "Regra":                regra,
-        "Segmento":             segmento,
-        "Cidade_Base":          cidade_base,
-        "Bairro_Base":          bairro_base,
-        "UF_Base":              uf_base,
-        "Nome_Cliente_Base":    nome_base,
-        "IE_Base":              ie_base,
-        "Produto":              produto,
-        "Tipo_Servico":         tipo_svc,
-        "Descricao_Servico":    desc_svc,
-        "Tipo_Imposto":         imposto,
-        "Promocao":             promo,
-        "Grupo_Localidade":     grupo,
-        "ID_Lote":              lote,
-        "CRM":                  crm,
+
+def _rel_base(base: dict, regra: str, status: str, substatus: str, obs: str,
+               dados_billing: str, dados_contrato: str | None, dados_tv: str | None) -> dict:
+    return {
+        "FATURA": base["Fatura"], "ID_CONTA_CONTRATO": base["ID_Cliente"],
+        "REGRA": regra, "SEGMENTO": base["Segmento"],
+        "STATUS": status, "SUBSTATUS": substatus, "OBSERVACAO": obs,
+        "DADOS_BILLING": dados_billing, "DADOS_CONTRATO": dados_contrato,
+        "DADOS_TABELA_VERDADE": dados_tv,
+        "ID_LOTE": base["ID_Lote"], "PRODUTO": base["Produto"],
+        "TIPO_SERVICO": base["Tipo_Servico"], "DESCRICAO_SERVICO": base["Desc_Servico"],
+        "TIPO_IMPOSTO": base["Tipo_Imposto"], "PROMOCAO": base.get("Promocao"),
+        "GRUPO_LOCALIDADE": base["Grupo_Localidade"], "CRM": base["CRM"],
     }
 
-    header = f"  [{int(i)+1:4d}/{total}] {doc_raw[:18]:<20} ({tipo}) "
 
-    # ------------------------------------------------------------------
-    # CEP genérico + CPF
-    # ------------------------------------------------------------------
-    if _cep_generico(cep_raw) and tipo == "CPF":
-        try:
-            end_gen    = _consultar_cep_cached(cep_raw)
-            cidade_gen = _normalizar(end_gen.get("Cidade", ""))
-            loc_str    = f"{end_gen.get('Cidade','')}/{end_gen.get('UF','')}"
-        except Exception:
-            cidade_gen = ""
-            loc_str    = "não identificada"
+# ---------------------------------------------------------------------------
+# Sub-validador 1 — DADOS CADASTRAIS (CNPJ only)
+# ---------------------------------------------------------------------------
 
-        cidade_ok_gen = bool(cidade_gen) and _normalizar(cidade_base_limpa) == cidade_gen
-        nota_gen = f"[CEP] CEP genérico: {cep_raw[:5]}-{cep_raw[5:]} (representa sede do município)"
-        if cidade_ok_gen:
-            obs_gen        = f"{nota_gen} | Município confirmado: {loc_str}"
-            status_gen     = "CORRETO"
-            substatus_gen  = "ALERTA"
-            status_val_gen = "CEP genérico - município confirmado"
-        else:
-            obs_gen        = f"{nota_gen} | Município divergente: base '{cidade_base_limpa}' x CEP '{loc_str}'"
-            status_gen     = "INCORRETO"
-            substatus_gen  = "ERRO"
-            status_val_gen = "CEP genérico - município divergente"
-
-        linha_val = {
-            **prefixo,
-            "Documento":        doc_num,
-            "Tipo":             "CPF",
-            "CEP_Informado":    cep_raw,
-            "Status_Validacao": status_val_gen,
-            "Observacao":       obs_gen,
-        }
-        linha_rel = {
-            "FATURA": fatura, "ID_CONTA_CONTRATO": id_cli, "REGRA": regra, "SEGMENTO": segmento,
-            "STATUS": status_gen, "SUBSTATUS": substatus_gen, "OBSERVACAO": obs_gen,
-            "DADOS_BILLING": f"NOME: {nome_base} | DOC: {doc_num} | CEP: {cep_raw} | CIDADE: {cidade_base} | UF: {uf_base} | IE: {ie_base or '-'}",
-            "DADOS_CONTRATO": None, "DADOS_TABELA_VERDADE": None,
-            "ID_LOTE": lote, "PRODUTO": produto, "TIPO_SERVICO": tipo_svc,
-            "DESCRICAO_SERVICO": desc_svc, "TIPO_IMPOSTO": imposto,
-            "PROMOCAO": promo or None, "GRUPO_LOCALIDADE": grupo, "CRM": crm,
-        }
-        return (i, linha_val, None, linha_rel, header + f"— CEP GENÉRICO | {status_gen} | {loc_str}")
-
-    # ------------------------------------------------------------------
-    # Documento inválido
-    # ------------------------------------------------------------------
-    if tipo == "INVALIDO":
-        linha_val = {
-            **prefixo,
-            "Documento":        doc_raw,
-            "Tipo":             "INVALIDO",
-            "CEP_Informado":    cep_raw,
-            "Status_Validacao": "Documento inválido",
-        }
-        linha_rel = {
-            "FATURA": fatura, "ID_CONTA_CONTRATO": id_cli, "REGRA": regra, "SEGMENTO": segmento,
-            "STATUS": "INCORRETO", "SUBSTATUS": "ERRO", "OBSERVACAO": "[DOC] Documento inválido",
-            "DADOS_BILLING": f"DOC: {doc_raw} | CEP: {cep_raw} | CIDADE: {cidade_base} | UF: {uf_base}",
-            "DADOS_CONTRATO": None, "DADOS_TABELA_VERDADE": None,
-            "ID_LOTE": lote, "PRODUTO": produto, "TIPO_SERVICO": tipo_svc,
-            "DESCRICAO_SERVICO": desc_svc, "TIPO_IMPOSTO": imposto,
-            "PROMOCAO": promo or None, "GRUPO_LOCALIDADE": grupo, "CRM": crm,
-        }
-        return (i, linha_val, None, linha_rel, header + "— DOCUMENTO INVÁLIDO")
-
-    # ------------------------------------------------------------------
-    # CPF: valida apenas via ViaCEP
-    # ------------------------------------------------------------------
-    if tipo == "CPF":
-        try:
-            end = _consultar_cep_cached(cep_raw)
-            cidade_cor = _normalizar(end.get("Cidade", ""))
-            uf_cor     = _normalizar(end.get("UF", ""))
-            cidade_ok  = not cidade_base_limpa or not cidade_cor or _normalizar(cidade_base_limpa) == cidade_cor
-            uf_ok      = not uf_base or not uf_cor or _normalizar(uf_base) == uf_cor
-
-            divs_cpf = []
-            if not cidade_ok:
-                divs_cpf.append(f"Cidade divergente: base '{cidade_base_limpa}' x Correios '{end.get('Cidade','')}'")
-            if not uf_ok:
-                divs_cpf.append(f"UF divergente: base '{uf_base}' x Correios '{end.get('UF','')}'")
-
-            obs_cpf        = " | ".join(divs_cpf)
-            status_cpf     = "INCORRETO" if divs_cpf else "CORRETO"
-            substatus_cpf  = "ERRO" if divs_cpf else "OK"
-            status_val_cpf = "Divergente" if divs_cpf else "Confere"
-
-            linha_val = {
-                **prefixo,
-                "Documento":        doc_num,
-                "Tipo":             "CPF",
-                "CEP_Informado":    cep_raw,
-                "Logradouro":       end.get("Logradouro", ""),
-                "Bairro":           end.get("Bairro", ""),
-                "Cidade":           end.get("Cidade", ""),
-                "UF":               end.get("UF", ""),
-                "Complemento":      end.get("Complemento", ""),
-                "Cidade_Confere":   "Sim" if cidade_ok else "Não",
-                "UF_Confere":       "Sim" if uf_ok else "Não",
-                "Fonte_CEP":        end.get("Fonte_CEP", ""),
-                "Status_Validacao": status_val_cpf,
-                "Observacao":       obs_cpf,
-            }
-            linha_rel = {
-                "FATURA": fatura, "ID_CONTA_CONTRATO": id_cli, "REGRA": regra, "SEGMENTO": segmento,
-                "STATUS": status_cpf, "SUBSTATUS": substatus_cpf, "OBSERVACAO": obs_cpf,
-                "DADOS_BILLING": f"NOME: {nome_base} | DOC: {doc_num} | CEP: {cep_raw} | CIDADE: {cidade_base} | UF: {uf_base} | IE: {ie_base or '-'}",
-                "DADOS_CONTRATO": None,
-                "DADOS_TABELA_VERDADE": f"CEP: {cep_raw} | LOGRADOURO: {end.get('Logradouro','')} | BAIRRO: {end.get('Bairro','')} | CIDADE: {end.get('Cidade','')} | UF: {end.get('UF','')}",
-                "ID_LOTE": lote, "PRODUTO": produto, "TIPO_SERVICO": tipo_svc,
-                "DESCRICAO_SERVICO": desc_svc, "TIPO_IMPOSTO": imposto,
-                "PROMOCAO": promo or None, "GRUPO_LOCALIDADE": grupo, "CRM": crm,
-            }
-            return (i, linha_val, None, linha_rel, header + f"— {status_val_cpf} | {end.get('Logradouro','')[:30]}, {end.get('Cidade','')}/{end.get('UF','')}")
-
-        except Exception as exc:
-            linha_val = {
-                **prefixo,
-                "Documento":        doc_num,
-                "Tipo":             "CPF",
-                "CEP_Informado":    cep_raw,
-                "Status_Validacao": f"Erro CEP: {exc}",
-            }
-            linha_rel = {
-                "FATURA": fatura, "ID_CONTA_CONTRATO": id_cli, "REGRA": regra, "SEGMENTO": segmento,
-                "STATUS": "INCORRETO", "SUBSTATUS": "ERRO",
-                "OBSERVACAO": f"[CEP] CEP não encontrado: {cep_raw}",
-                "DADOS_BILLING": f"NOME: {nome_base} | DOC: {doc_num} | CEP: {cep_raw} | CIDADE: {cidade_base} | UF: {uf_base} | IE: {ie_base or '-'}",
-                "DADOS_CONTRATO": None, "DADOS_TABELA_VERDADE": None,
-                "ID_LOTE": lote, "PRODUTO": produto, "TIPO_SERVICO": tipo_svc,
-                "DESCRICAO_SERVICO": desc_svc, "TIPO_IMPOSTO": imposto,
-                "PROMOCAO": promo or None, "GRUPO_LOCALIDADE": grupo, "CRM": crm,
-            }
-            return (i, linha_val, None, linha_rel, header + f"— ERRO CEP: {exc}")
-
-    # ------------------------------------------------------------------
-    # CNPJ: lê do cache em memória (sem chamada de API em runtime)
-    # ------------------------------------------------------------------
-    receita = _cache_receita.get(doc_num)
+def _val_dados_cadastrais(base: dict, doc_num: str, receita: dict | None, nome_base: str) -> tuple:
+    regra = "DADOS_CADASTRAIS"
+    billing = f"NOME: {nome_base} | DOC: {doc_num}"
 
     if receita is None:
-        # CNPJ não foi carregado pelo notebook de carga — avisar operador
-        obs_nc = "[CACHE] CNPJ não encontrado em tb_dados_receita. Execute carga_dados_receita_notebook."
-        linha_val = {
-            **prefixo,
-            "Documento":        doc_num,
-            "Tipo":             "CNPJ",
-            "CEP_Informado":    cep_raw,
-            "Status_Validacao": "nao_carregado_na_cache",
-            "Observacao":       obs_nc,
-        }
-        linha_rel = {
-            "FATURA": fatura, "ID_CONTA_CONTRATO": id_cli, "REGRA": regra, "SEGMENTO": segmento,
-            "STATUS": "PENDENTE", "SUBSTATUS": "CACHE_VAZIO", "OBSERVACAO": obs_nc,
-            "DADOS_BILLING": f"NOME: {nome_base} | DOC: {doc_num} | CEP: {cep_raw} | CIDADE: {cidade_base} | UF: {uf_base}",
-            "DADOS_CONTRATO": None, "DADOS_TABELA_VERDADE": None,
-            "ID_LOTE": lote, "PRODUTO": produto, "TIPO_SERVICO": tipo_svc,
-            "DESCRICAO_SERVICO": desc_svc, "TIPO_IMPOSTO": imposto,
-            "PROMOCAO": promo or None, "GRUPO_LOCALIDADE": grupo, "CRM": crm,
-        }
-        return (i, linha_val, None, linha_rel, header + "— NÃO CARREGADO NO CACHE")
+        obs = "[CACHE] CNPJ não encontrado em tab_dados_receita. Execute a célula de populate."
+        return (
+            {**base, "REGRA": regra, "Documento": doc_num, "Tipo": "CNPJ",
+             "Status_Validacao": "nao_carregado", "Observacao": obs},
+            None,
+            _rel_base(base, regra, "PENDENTE", "CACHE_VAZIO", obs, billing, None, None),
+            f"{regra} — NÃO CARREGADO NO CACHE",
+        )
 
-    # Valida CEP da Receita via ViaCEP
-    cep_receita = (receita.get("receita_cep") or "").replace("-", "").strip().zfill(8)
-    try:
-        end_correios = _consultar_cep_cached(cep_receita) if cep_receita and cep_receita != "00000000" else {"Status_CEP": "CEP vazio"}
-    except Exception as exc:
-        end_correios = {"Status_CEP": str(exc)}
+    divs = []
+    sit = (receita.get("situacao_cadastral") or "").upper()
+    if sit and sit not in ("ATIVA",):
+        divs.append(f"Situação: {receita.get('situacao_cadastral','')}")
 
-    status_end = comparar_enderecos(receita, end_correios)
+    razao_rec  = _normalizar(receita.get("razao_social") or "")
+    razao_base = _normalizar(nome_base)
+    if razao_rec and razao_base and razao_rec != razao_base:
+        divs.append(f"Razão social divergente: base '{nome_base[:40]}' x Receita '{(receita.get('razao_social') or '')[:40]}'")
 
-    cidade_rec = _normalizar(receita.get("receita_municipio", ""))
-    uf_rec     = _normalizar(receita.get("receita_uf", ""))
-    cidade_ok  = not cidade_base_limpa or not cidade_rec or _normalizar(cidade_base_limpa) == cidade_rec
-    uf_ok      = not uf_base or not uf_rec or _normalizar(uf_base) == uf_rec
-    cep_ok     = cep_raw == cep_receita
-    mun_base   = _normalizar(cidade_base_limpa)
-    mun_rec    = _normalizar(receita.get("receita_municipio", ""))
-
-    divergencias = []
-    if _cep_generico(cep_raw):
-        nota_gen_b = f"[CEP] CEP da base é genérico: {cep_raw[:5]}-{cep_raw[5:]}"
-        if mun_rec and mun_rec == mun_base:
-            divergencias.append(f"{nota_gen_b} | Município confirmado: {receita.get('receita_municipio','')}")
-        else:
-            divergencias.append(f"{nota_gen_b} | Município divergente: base '{cidade_base_limpa}' x Receita '{receita.get('receita_municipio','')}'")
-    if _cep_generico(cep_receita):
-        nota_gen_r = f"[CEP] CEP da Receita é genérico: {cep_receita[:5]}-{cep_receita[5:]}"
-        if mun_rec and mun_rec == mun_base:
-            divergencias.append(f"{nota_gen_r} | Município confirmado: {receita.get('receita_municipio','')}")
-        else:
-            divergencias.append(f"{nota_gen_r} | Município divergente: base '{cidade_base_limpa}' x Receita '{receita.get('receita_municipio','')}'")
-    if not cep_ok:
-        divergencias.append(f"CEP divergente: base '{cep_raw}' x Receita '{cep_receita}'")
-    if not cidade_ok:
-        divergencias.append(f"Cidade divergente: base '{cidade_base_limpa}' x Receita '{receita.get('receita_municipio','')}'")
-    if not uf_ok:
-        divergencias.append(f"UF divergente: base '{uf_base}' x Receita '{receita.get('receita_uf','')}'")
-    if status_end == "Divergente":
-        divergencias.append("Endereço Receita x Correios divergente")
-    elif status_end == "CEP não encontrado nos Correios":
-        divergencias.append("CEP da Receita não encontrado nos Correios")
-
-    status_validacao = "Divergente" if divergencias else "Confere"
-    observacao       = " | ".join(divergencias)
-
-    linha_val = {
-        **prefixo,
-        "Documento":                 doc_num,
-        "Tipo":                      "CNPJ",
-        "CEP_Informado":             cep_raw,
-        "CEP_Receita":               cep_receita,
-        "CEP_Confere_com_Informado": "Sim" if cep_ok else "Não",
-        "Cidade_Confere":            "Sim" if cidade_ok else "Não",
-        "UF_Confere":                "Sim" if uf_ok else "Não",
-        "Logradouro_Receita":        receita.get("receita_logradouro", ""),
-        "Numero_Receita":            receita.get("receita_numero", ""),
-        "Complemento_Receita":       receita.get("receita_complemento", ""),
-        "Bairro_Receita":            receita.get("receita_bairro", ""),
-        "Cidade_Receita":            receita.get("receita_municipio", ""),
-        "UF_Receita":                receita.get("receita_uf", ""),
-        "Logradouro_Correios":       end_correios.get("Logradouro", ""),
-        "Bairro_Correios":           end_correios.get("Bairro", ""),
-        "Cidade_Correios":           end_correios.get("Cidade", ""),
-        "UF_Correios":               end_correios.get("UF", ""),
-        "Fonte_CEP":                 end_correios.get("Fonte_CEP", ""),
-        "Status_Validacao":          status_validacao,
-        "Observacao":                observacao,
-        "Razao_Social":              receita.get("razao_social", ""),
-        "Situacao_Cadastral":        receita.get("situacao_cadastral", ""),
-        "Data_Consulta_Receita":     receita.get("data_consulta", ""),
-    }
-
-    _end_rec = (
-        f"{receita.get('receita_logradouro','')}, {receita.get('receita_numero','')}"
-        f" - {receita.get('receita_bairro','')} - {receita.get('receita_municipio','')}/{receita.get('receita_uf','')}"
-    ).strip(", -/")
-
-    linha_rel = {
-        "FATURA": fatura, "ID_CONTA_CONTRATO": id_cli, "REGRA": regra, "SEGMENTO": segmento,
-        "STATUS": "INCORRETO" if divergencias else "CORRETO",
-        "SUBSTATUS": "ERRO" if divergencias else "OK",
-        "OBSERVACAO": observacao,
-        "DADOS_BILLING": f"NOME: {nome_base} | DOC: {doc_num} | CEP: {cep_raw} | CIDADE: {cidade_base} | UF: {uf_base} | IE: {ie_base or '-'}",
-        "DADOS_CONTRATO": f"RAZAO: {receita.get('razao_social','')} | SITUACAO: {receita.get('situacao_cadastral','')} | CEP: {cep_receita} | END: {_end_rec}",
-        "DADOS_TABELA_VERDADE": None,
-        "ID_LOTE": lote, "PRODUTO": produto, "TIPO_SERVICO": tipo_svc,
-        "DESCRICAO_SERVICO": desc_svc, "TIPO_IMPOSTO": imposto,
-        "PROMOCAO": promo or None, "GRUPO_LOCALIDADE": grupo, "CRM": crm,
-    }
+    obs    = " | ".join(divs)
+    sv     = "Divergente" if divs else "Confere"
+    status = "INCORRETO" if divs else "CORRETO"
 
     linha_cad = {
-        **prefixo,
+        **base, "REGRA": regra,
         "CNPJ":                     doc_num,
         "Razao_Social":             receita.get("razao_social"),
         "Nome_Fantasia":            receita.get("nome_fantasia"),
@@ -932,17 +696,211 @@ def _processar_linha(args: tuple) -> tuple:
         "UF_Receita":               receita.get("receita_uf"),
         "Data_Consulta_Receita":    receita.get("data_consulta"),
     }
-
-    log_msg = (
-        header
-        + f"— {status_validacao} | "
-        + f"{(receita.get('razao_social') or '')[:30]} | "
-        + f"CEP Receita: {cep_receita}"
+    contrato = (f"RAZAO: {receita.get('razao_social','')} | "
+                f"SITUACAO: {receita.get('situacao_cadastral','')} | "
+                f"CEP: {receita.get('receita_cep','')} | "
+                f"CIDADE: {receita.get('receita_municipio','')}/{receita.get('receita_uf','')}")
+    return (
+        {**base, "REGRA": regra, "Documento": doc_num, "Tipo": "CNPJ",
+         "Razao_Social": receita.get("razao_social",""),
+         "Situacao_Cadastral": receita.get("situacao_cadastral",""),
+         "Status_Validacao": sv, "Observacao": obs},
+        linha_cad,
+        _rel_base(base, regra, status, "ERRO" if divs else "OK", obs, billing, contrato, None),
+        f"{regra} — {sv}",
     )
-    return (i, linha_val, linha_cad, linha_rel, log_msg)
 
 
-print("Worker _processar_linha carregado.")
+# ---------------------------------------------------------------------------
+# Sub-validador 2 — ENDEREÇO LEGAL
+# CPF: valida via tab_dados_cep (cidade/uf)
+# CNPJ: idem + cruza com endereço registrado na Receita
+# ---------------------------------------------------------------------------
+
+def _val_endereco_legal(base: dict, tipo: str, doc_num: str,
+                         cep_raw: str, cidade: str, uf: str,
+                         nome_base: str, ie_base: str,
+                         receita: dict | None) -> tuple:
+    regra = "ENDERECO_LEGAL"
+    cidade_limpa = re.sub(r"\s*-\s*\w+$", "", cidade).strip()
+    end  = _cep_end(cep_raw)
+    divs = []
+
+    if end["Status_CEP"] == "ERRO":
+        divs.append(f"[CEP] CEP não encontrado no cache: {cep_raw}")
+    elif _cep_generico(cep_raw):
+        divs += _divs_cep_generico(cep_raw, cidade, end)
+    else:
+        divs += _check_cidade_uf(cidade, uf, end)
+
+    # CNPJ: compara também com Receita Federal
+    if tipo == "CNPJ":
+        if receita is None:
+            divs.append("[CACHE] CNPJ não encontrado em tab_dados_receita")
+        else:
+            cep_rec = (receita.get("receita_cep") or "")
+            if cep_raw != cep_rec:
+                divs.append(f"CEP divergente: base '{cep_raw}' x Receita '{cep_rec}'")
+            mn_base = _normalizar(cidade_limpa)
+            mn_rec  = _normalizar(receita.get("receita_municipio",""))
+            if mn_base and mn_rec and mn_base != mn_rec:
+                divs.append(f"Cidade divergente: base '{cidade_limpa}' x Receita '{receita.get('receita_municipio','')}'")
+            uf_base_n = _normalizar(uf)
+            uf_rec_n  = _normalizar(receita.get("receita_uf",""))
+            if uf_base_n and uf_rec_n and uf_base_n != uf_rec_n:
+                divs.append(f"UF divergente: base '{uf}' x Receita '{receita.get('receita_uf','')}'")
+
+    obs    = " | ".join(divs)
+    sv     = "Divergente" if divs else "Confere"
+    status = "INCORRETO" if divs else "CORRETO"
+    billing = f"NOME: {nome_base} | DOC: {doc_num} | CEP: {cep_raw} | CIDADE: {cidade} | UF: {uf} | IE: {ie_base or '-'}"
+    tv      = f"CEP: {cep_raw} | LOGRADOURO: {end.get('Logradouro','')} | CIDADE: {end.get('Cidade','')} | UF: {end.get('UF','')}"
+    contrato = None
+    if tipo == "CNPJ" and receita:
+        contrato = (f"RAZAO: {receita.get('razao_social','')} | "
+                    f"CEP: {receita.get('receita_cep','')} | "
+                    f"CIDADE: {receita.get('receita_municipio','')}/{receita.get('receita_uf','')}")
+
+    linha_val = {
+        **base, "REGRA": regra,
+        "Documento":      doc_num, "Tipo": tipo,
+        "CEP_Legal":      cep_raw,
+        "Logradouro_CEP": end.get("Logradouro",""),
+        "Bairro_CEP":     end.get("Bairro",""),
+        "Cidade_CEP":     end.get("Cidade",""),
+        "UF_CEP":         end.get("UF",""),
+        "Cidade_Confere": "Sim" if _normalizar(cidade_limpa)==_normalizar(end.get("Cidade","")) else "Não",
+        "UF_Confere":     "Sim" if _normalizar(uf)==_normalizar(end.get("UF","")) else "Não",
+        "Fonte_CEP":      end.get("Fonte_CEP","tab_dados_cep"),
+        "Status_Validacao": sv, "Observacao": obs,
+    }
+    if tipo == "CNPJ" and receita:
+        linha_val.update({
+            "CEP_Receita":        receita.get("receita_cep",""),
+            "Cidade_Receita":     receita.get("receita_municipio",""),
+            "UF_Receita":         receita.get("receita_uf",""),
+            "Razao_Social":       receita.get("razao_social",""),
+            "Situacao_Cadastral": receita.get("situacao_cadastral",""),
+        })
+    return (linha_val, None, _rel_base(base, regra, status, "ERRO" if divs else "OK", obs, billing, contrato, tv),
+            f"{regra} — {sv}")
+
+
+# ---------------------------------------------------------------------------
+# Sub-validador 3 — ENDEREÇO DE INSTALAÇÃO
+# CPF e CNPJ: valida apenas via tab_dados_cep (sem cruzar com Receita)
+# O endereço de instalação não precisa bater com o endereço legal/Receita
+# ---------------------------------------------------------------------------
+
+def _val_endereco_instalacao(base: dict, tipo: str, doc_num: str,
+                              cep_raw: str, cidade: str, uf: str,
+                              nome_base: str, ie_base: str) -> tuple:
+    regra = "ENDERECO_INSTALACAO"
+    cidade_limpa = re.sub(r"\s*-\s*\w+$", "", cidade).strip()
+    end  = _cep_end(cep_raw)
+    divs = []
+
+    if end["Status_CEP"] == "ERRO":
+        divs.append(f"[CEP] CEP não encontrado no cache: {cep_raw}")
+    elif _cep_generico(cep_raw):
+        divs += _divs_cep_generico(cep_raw, cidade, end)
+    else:
+        divs += _check_cidade_uf(cidade, uf, end)
+
+    obs    = " | ".join(divs)
+    sv     = "Divergente" if divs else "Confere"
+    status = "INCORRETO" if divs else "CORRETO"
+    billing = f"NOME: {nome_base} | DOC: {doc_num} | CEP: {cep_raw} | CIDADE: {cidade} | UF: {uf} | IE: {ie_base or '-'}"
+    tv      = f"CEP: {cep_raw} | LOGRADOURO: {end.get('Logradouro','')} | CIDADE: {end.get('Cidade','')} | UF: {end.get('UF','')}"
+
+    linha_val = {
+        **base, "REGRA": regra,
+        "Documento":        doc_num, "Tipo": tipo,
+        "CEP_Instalacao":   cep_raw,
+        "Logradouro_CEP":   end.get("Logradouro",""),
+        "Bairro_CEP":       end.get("Bairro",""),
+        "Cidade_CEP":       end.get("Cidade",""),
+        "UF_CEP":           end.get("UF",""),
+        "Cidade_Confere":   "Sim" if _normalizar(cidade_limpa)==_normalizar(end.get("Cidade","")) else "Não",
+        "UF_Confere":       "Sim" if _normalizar(uf)==_normalizar(end.get("UF","")) else "Não",
+        "Fonte_CEP":        end.get("Fonte_CEP","tab_dados_cep"),
+        "Status_Validacao": sv, "Observacao": obs,
+    }
+    return (linha_val, None, _rel_base(base, regra, status, "ERRO" if divs else "OK", obs, billing, None, tv),
+            f"{regra} — {sv}")
+
+
+# ---------------------------------------------------------------------------
+# Worker principal — gera até 3 registros por linha
+# ---------------------------------------------------------------------------
+
+def _processar_linha(args: tuple) -> tuple:
+    """Retorna (i, [(linha_val, linha_cad, linha_rel, log_msg), ...])"""
+    i, row_dict, col_map, total = args
+
+    def _v(col):
+        v = str(row_dict.get(col, "")).strip() if col else ""
+        return "" if v in ("nan", "None") else v
+
+    doc_raw  = str(row_dict.get(col_map["doc"], "")).strip()
+    tipo     = tipo_documento(doc_raw)
+    doc_num  = _limpar_doc(doc_raw)
+
+    fatura   = _v(col_map["fatura"])
+    id_cli   = _v(col_map["id"])
+    segmento = _v(col_map["seg"])
+    nome_base= _v(col_map["nome"])
+    ie_base  = _v(col_map["ie"])
+
+    def _cep(col):
+        return re.sub(r"\D", "", _v(col_map[col])).zfill(8)
+
+    cep_legal = _cep("cep_legal")
+    cidade_legal = _v(col_map["cidade_legal"])
+    uf_legal     = _v(col_map["uf_legal"])
+
+    cep_inst     = _cep("cep_inst")
+    cidade_inst  = _v(col_map["cidade_inst"])
+    uf_inst      = _v(col_map["uf_inst"])
+
+    base = {
+        "Fatura": fatura, "ID_Cliente": id_cli, "Segmento": segmento,
+        "Produto": _v(col_map["produto"]), "Tipo_Servico": _v(col_map["tpsvc"]),
+        "Desc_Servico": _v(col_map["dssvc"]), "Tipo_Imposto": _v(col_map["imposto"]),
+        "Promocao": _v(col_map["promo"]) or None,
+        "Grupo_Localidade": _v(col_map["grupo"]),
+        "ID_Lote": _v(col_map["lote"]), "CRM": _v(col_map["crm"]),
+    }
+
+    header = f"  [{int(i)+1:4d}/{total}] {doc_raw[:18]:<20} ({tipo})"
+
+    if tipo == "INVALIDO":
+        obs = "[DOC] Documento inválido"
+        r = _rel_base(base, "INVALIDO", "INCORRETO", "ERRO", obs,
+                      f"DOC: {doc_raw}", None, None)
+        val = {**base, "REGRA": "INVALIDO", "Documento": doc_raw,
+               "Tipo": "INVALIDO", "Status_Validacao": "Documento inválido"}
+        return (i, [(val, None, r, header + " — DOCUMENTO INVÁLIDO")])
+
+    receita = _cache_receita.get(doc_num) if tipo == "CNPJ" else None
+    results = []
+
+    # 1. DADOS CADASTRAIS — somente CNPJ
+    if tipo == "CNPJ":
+        results.append(_val_dados_cadastrais(base, doc_num, receita, nome_base))
+
+    # 2. ENDEREÇO LEGAL — CPF e CNPJ
+    results.append(_val_endereco_legal(base, tipo, doc_num, cep_legal,
+                                       cidade_legal, uf_legal, nome_base, ie_base, receita))
+
+    # 3. ENDEREÇO DE INSTALAÇÃO — CPF e CNPJ (sem cruzar com Receita)
+    results.append(_val_endereco_instalacao(base, tipo, doc_num, cep_inst,
+                                            cidade_inst, uf_inst, nome_base, ie_base))
+
+    return (i, results)
+
+
+print("Workers carregados: _val_dados_cadastrais | _val_endereco_legal | _val_endereco_instalacao")
 
 # COMMAND ----------
 
@@ -951,73 +909,115 @@ print("Worker _processar_linha carregado.")
 
 # COMMAND ----------
 
-col_doc     = _encontrar_coluna(df, ["CPF_CNPJ", "CPF/CNPJ", "DOCUMENTO", "CNPJ", "CPF", "DOC"])
-col_cep     = _encontrar_coluna(df, ["CEP"])
-col_fatura  = _encontrar_coluna(df, ["FATURA"])
-col_id      = _encontrar_coluna(df, ["ID_CLIENTE_CONTRATO", "ID_CLIENTE", "ID"])
-col_regra   = _encontrar_coluna(df, ["REGRA"])
-col_cidade  = _encontrar_coluna(df, ["CIDADE", "CITY"])
-col_bairro  = _encontrar_coluna(df, ["BAIRRO"])
-col_uf      = _encontrar_coluna(df, ["UF", "ESTADO", "STATE"])
-col_nome    = _encontrar_coluna(df, ["NOME_CLIENTE", "NOME", "CLIENTE"])
-col_ie      = _encontrar_coluna(df, ["INSCRICAO_ESTADUAL", "IE"])
-col_produto = _encontrar_coluna(df, ["PRODUTO"])
-col_tpsvc   = _encontrar_coluna(df, ["TIPO_SERVICO"])
-col_dssvc   = _encontrar_coluna(df, ["DESCRICAO_SERVICO"])
-col_imposto = _encontrar_coluna(df, ["TIPO_IMPOSTO"])
-col_promo   = _encontrar_coluna(df, ["PROMOCAO"])
-col_grupo   = _encontrar_coluna(df, ["GRUPO_LOCALIDADE"])
-col_lote    = _encontrar_coluna(df, ["ID_LOTE"])
-col_seg     = _encontrar_coluna(df, ["SEGMENTO"])
-col_crm     = _encontrar_coluna(df, ["CRM", "SISTEMA_ORIGEM"])
+col_doc          = _encontrar_coluna(df, ["CPF_CNPJ", "CPF/CNPJ", "DOCUMENTO", "CNPJ", "CPF", "DOC"])
+col_fatura       = _encontrar_coluna(df, ["FATURA"])
+col_id           = _encontrar_coluna(df, ["ID_CLIENTE_CONTRATO", "ID_CLIENTE", "ID"])
+col_nome         = _encontrar_coluna(df, ["NOME_CLIENTE", "NOME", "CLIENTE"])
+col_ie           = _encontrar_coluna(df, ["INSCRICAO_ESTADUAL", "IE"])
+col_seg          = _encontrar_coluna(df, ["SEGMENTO"])
+col_produto      = _encontrar_coluna(df, ["PRODUTO"])
+col_tpsvc        = _encontrar_coluna(df, ["TIPO_SERVICO"])
+col_dssvc        = _encontrar_coluna(df, ["DESCRICAO_SERVICO"])
+col_imposto      = _encontrar_coluna(df, ["TIPO_IMPOSTO"])
+col_promo        = _encontrar_coluna(df, ["PROMOCAO"])
+col_grupo        = _encontrar_coluna(df, ["GRUPO_LOCALIDADE"])
+col_lote         = _encontrar_coluna(df, ["ID_LOTE"])
+col_crm          = _encontrar_coluna(df, ["CRM", "SISTEMA_ORIGEM"])
+
+# Endereço de instalação (onde o cliente está instalado)
+col_cep_inst    = _encontrar_coluna(df, ["cep_instalacao", "CEP_INSTALACAO", "CEP"])
+col_cidade_inst = _encontrar_coluna(df, ["cidade_instalacao", "CIDADE_INSTALACAO", "CIDADE"])
+col_uf_inst     = _encontrar_coluna(df, ["uf_instalacao", "UF_INSTALACAO", "UF"])
+
+# Endereço legal / fiscal (cadastrado na Receita / boleto)
+col_cep_legal    = _encontrar_coluna(df, ["cep_legal", "CEP_LEGAL"])
+col_cidade_legal = _encontrar_coluna(df, ["cidade_legal", "CIDADE_LEGAL"])
+col_uf_legal     = _encontrar_coluna(df, ["uf_legal", "UF_LEGAL"])
+
+# Fallback: se não há colunas separadas, usa instalação para ambos
+if col_cep_legal is None:
+    col_cep_legal    = col_cep_inst
+    col_cidade_legal = col_cidade_inst
+    col_uf_legal     = col_uf_inst
 
 if col_doc is None:
-    raise ValueError("Coluna de documento não encontrada.")
-if col_cep is None:
-    raise ValueError("Coluna CEP não encontrada.")
+    raise ValueError("Coluna de documento não encontrada no DataFrame.")
+if col_cep_inst is None:
+    raise ValueError("Coluna CEP não encontrada no DataFrame.")
 
 col_map = {
-    "doc": col_doc, "cep": col_cep, "fatura": col_fatura, "id": col_id,
-    "regra": col_regra, "cidade": col_cidade, "bairro": col_bairro, "uf": col_uf,
-    "nome": col_nome, "ie": col_ie, "produto": col_produto, "tpsvc": col_tpsvc,
-    "dssvc": col_dssvc, "imposto": col_imposto, "promo": col_promo,
-    "grupo": col_grupo, "lote": col_lote, "seg": col_seg, "crm": col_crm,
+    "doc":          col_doc,
+    "fatura":       col_fatura,
+    "id":           col_id,
+    "seg":          col_seg,
+    "nome":         col_nome,
+    "ie":           col_ie,
+    "produto":      col_produto,
+    "tpsvc":        col_tpsvc,
+    "dssvc":        col_dssvc,
+    "imposto":      col_imposto,
+    "promo":        col_promo,
+    "grupo":        col_grupo,
+    "lote":         col_lote,
+    "crm":          col_crm,
+    # Instalação
+    "cep_inst":     col_cep_inst,
+    "cidade_inst":  col_cidade_inst,
+    "uf_inst":      col_uf_inst,
+    # Legal
+    "cep_legal":    col_cep_legal,
+    "cidade_legal": col_cidade_legal,
+    "uf_legal":     col_uf_legal,
 }
 
 total = len(df)
-fonte_cep = "Correios API" if TOKEN else "ViaCEP (gratuito)"
-print(f"Processando {total} registros | CEP via {fonte_cep} | Receita via cache ({len(_cache_receita)} CNPJs) | workers=20\n")
+print(f"Processando {total} registros | Receita cache={len(_cache_receita)} CNPJs | CEP cache={len(_cep_cache)} CEPs | workers=20\n")
 
 args_list = [(i, row.to_dict(), col_map, total) for i, row in df.iterrows()]
 
-resultados: dict = {}
+_resultados_raw: dict = {}
 with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
     futures = {executor.submit(_processar_linha, args): args[0] for args in args_list}
     for future in concurrent.futures.as_completed(futures):
-        idx, linha_val, linha_cad, linha_rel, log_msg = future.result()
-        resultados[idx] = (linha_val, linha_cad, linha_rel, log_msg)
+        idx, lista_resultados = future.result()
+        _resultados_raw[idx] = lista_resultados
 
 linhas_validacao:  list[dict] = []
 linhas_cadastrais: list[dict] = []
 linhas_relatorio:  list[dict] = []
 
-for idx in sorted(resultados.keys()):
-    linha_val, linha_cad, linha_rel, log_msg = resultados[idx]
-    if linha_val is not None:
-        linhas_validacao.append(linha_val)
-    if linha_cad is not None:
-        linhas_cadastrais.append(linha_cad)
-    if linha_rel is not None:
-        linhas_relatorio.append(linha_rel)
-    print(log_msg)
+n_cad = n_end_legal = n_end_inst = n_ok = n_div = n_erro = 0
 
-ok        = sum(1 for r in linhas_validacao if r.get("Status_Validacao") in ("Confere", "CEP encontrado"))
-div       = sum(1 for r in linhas_validacao if r.get("Status_Validacao") == "Divergente")
-sem_cache = sum(1 for r in linhas_validacao if r.get("Status_Validacao") == "nao_carregado_na_cache")
-erro      = len(linhas_validacao) - ok - div - sem_cache
-print(f"\nConcluído: {ok} OK | {div} divergente(s) | {sem_cache} sem cache | {erro} erro(s)")
-if sem_cache:
-    print(f"  ⚠ {sem_cache} CNPJs não estão em tb_dados_receita — rode carga_dados_receita_notebook.")
+for idx in sorted(_resultados_raw.keys()):
+    for linha_val, linha_cad, linha_rel, log_msg in _resultados_raw[idx]:
+        if linha_val is not None:
+            linhas_validacao.append(linha_val)
+            regra = linha_val.get("REGRA", "")
+            sv    = linha_val.get("Status_Validacao", "")
+            if regra == "DADOS_CADASTRAIS":
+                n_cad += 1
+            elif regra == "ENDERECO_LEGAL":
+                n_end_legal += 1
+            elif regra == "ENDERECO_INSTALACAO":
+                n_end_inst += 1
+            if sv in ("Confere", "OK"):
+                n_ok += 1
+            elif sv == "Divergente":
+                n_div += 1
+            elif sv not in ("", None):
+                n_erro += 1
+        if linha_cad is not None:
+            linhas_cadastrais.append(linha_cad)
+        if linha_rel is not None:
+            linhas_relatorio.append(linha_rel)
+        if log_msg:
+            print(log_msg)
+
+print(
+    f"\nConcluído — registros gerados: "
+    f"DADOS_CADASTRAIS={n_cad} | ENDERECO_LEGAL={n_end_legal} | ENDERECO_INSTALACAO={n_end_inst}"
+    f"\nResultados: OK={n_ok} | Divergente={n_div} | Outros={n_erro}"
+)
 
 # COMMAND ----------
 

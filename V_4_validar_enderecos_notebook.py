@@ -1,43 +1,37 @@
 # Databricks notebook source
-
 # COMMAND ----------
-
 # MAGIC %md
-# MAGIC # Validação de Endereços e Dados Cadastrais — V3
+# MAGIC # Validação de Endereços e Dados Cadastrais — V4
 # MAGIC
-# MAGIC **Diferença vs V2:** pipeline reescrito em Spark nativo — sem `.toPandas()` no DataFrame principal.
+# MAGIC **Diferença vs V3:** Section 4 não chama a BrasilAPI — lê um arquivo dump (CSV / Parquet / Delta)
+# MAGIC da Receita Federal, faz JOIN com a base de clientes e insere os CNPJs correspondentes em
+# MAGIC `tab_dados_receita` via MERGE incremental.
 # MAGIC
-# MAGIC **Arquitetura V3:**
+# MAGIC **Arquitetura V4:**
 # MAGIC ```
 # MAGIC spark.sql() → cache() → JOIN tab_dados_receita + tab_dados_cep → CASE WHEN columns → SELECT por tabela → write
+# MAGIC tab_dados_receita ← leitura de dump (CSV/Parquet/Delta) + JOIN base clientes + MERGE incremental
 # MAGIC ```
 # MAGIC
 # MAGIC **Saída (tabelas Delta):**
 # MAGIC - `hive_metastore.accenture.validacao_enderecos`
 # MAGIC - `hive_metastore.accenture.validacao_dados_cadastrais`
 # MAGIC - `hive_metastore.accenture.validacao_status_fatura`
-
 # COMMAND ----------
-
 # MAGIC %md
 # MAGIC ## 1. Imports e configuração
-
 # COMMAND ----------
 
 from __future__ import annotations
 
 import concurrent.futures
 import re
-import threading
 import time
 import unicodedata
 from datetime import datetime
 from typing import Any
-from urllib.parse import quote
 
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from delta.tables import DeltaTable
 import pandas as pd
 from pyspark.sql import SparkSession
@@ -48,14 +42,9 @@ from pyspark.sql.types import (
 )
 
 
-print("V3 — Processamento nativo Spark (sem .toPandas())")
+print("V4 — Processamento nativo Spark (sem .toPandas()) | Receita via dump de arquivo")
 
 spark = SparkSession.getActiveSession()
-
-try:
-    spark.conf.set("spark.sql.ansi.enabled", "false")
-except Exception:
-    pass  # Serverless pode não permitir — o _sem_strings_vazias() cobre esse caso
 
 try:
     TOKEN = dbutils.secrets.get(scope="vero", key="correios_token")
@@ -69,8 +58,48 @@ TABELA_CEP     = f"{CATALOG}.tab_dados_cep"
 # Limite de registros para processar. None = sem limite (produção).
 LIMIT_REGISTROS = None  # ex: 1000 para teste
 
-# BrasilAPI: 1 chamada simultânea para evitar 429
-_brasilapi_sem = threading.Semaphore(1)
+# ---------------------------------------------------------------------------
+# Configuração do dump da Receita Federal
+# ---------------------------------------------------------------------------
+
+# Caminho do arquivo dump da Receita Federal
+# Suporta: CSV (sep=";"), Parquet, ou Delta
+# Exemplos:
+#   "dbfs:/FileStore/receita/dump_cnpj.csv"
+#   "dbfs:/FileStore/receita/dump_cnpj.parquet"
+#   "hive_metastore.accenture.dump_receita_federal"
+ARQUIVO_DUMP_RECEITA = "dbfs:/FileStore/receita/dump_cnpj.csv"
+FORMATO_DUMP         = "csv"   # "csv", "parquet", "delta"
+SEP_CSV              = ";"     # separador quando FORMATO_DUMP = "csv"
+
+# Mapeamento: coluna_no_dump -> campo_em_tab_dados_receita
+# Ajuste conforme o schema do arquivo recebido.
+# Campos não mapeados ficam NULL na tabela.
+MAPA_COLUNAS = {
+    "cnpj":                      "CNPJ",                    # 14 dígitos sem máscara
+    "razao_social":               "RAZAO_SOCIAL",
+    "nome_fantasia":              "NOME_FANTASIA",
+    "situacao_cadastral":         "SITUACAO_CADASTRAL",
+    "data_situacao_cadastral":    "DATA_SITUACAO_CADASTRAL",
+    "motivo_situacao_cadastral":  "MOTIVO_SITUACAO_CADASTRAL",
+    "natureza_juridica":          "NATUREZA_JURIDICA",
+    "data_inicio_atividade":      "DATA_INICIO_ATIVIDADE",
+    "cnae_principal_codigo":      "CNAE_FISCAL",
+    "cnae_principal_descricao":   "CNAE_FISCAL_DESCRICAO",
+    "porte":                      "PORTE",
+    "capital_social":             "CAPITAL_SOCIAL",
+    "opcao_simples":              "OPCAO_SIMPLES",
+    "opcao_mei":                  "OPCAO_MEI",
+    "email":                      "EMAIL",
+    "telefone":                   "TELEFONE",
+    "receita_cep":                "CEP",
+    "receita_logradouro":         "LOGRADOURO",
+    "receita_numero":             "NUMERO",
+    "receita_complemento":        "COMPLEMENTO",
+    "receita_bairro":             "BAIRRO",
+    "receita_municipio":          "MUNICIPIO",
+    "receita_uf":                 "UF",
+}
 
 # COMMAND ----------
 
@@ -212,7 +241,7 @@ display(sdf.limit(5))
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 4. Popula tab_dados_receita com CNPJs ainda não carregados
+# MAGIC ## 4. Popula tab_dados_receita — leitura de arquivo dump da Receita Federal
 
 # COMMAND ----------
 
@@ -247,89 +276,6 @@ _SCHEMA_RECEITA = StructType([
 _VAZIOS_RECEITA = {"", "nan", "NaN", "None", "none", "null", "NULL", "NaT", "na", "NA"}
 
 
-def _consultar_receita_api(cnpj: str) -> dict:
-    """Consulta BrasilAPI e retorna dict normalizado para gravar no Delta."""
-    url = f"https://brasilapi.com.br/api/cnpj/v1/{quote(cnpj)}"
-    retry = Retry(total=4, backoff_factor=1.5, status_forcelist=[429, 500, 502, 503, 504],
-                  allowed_methods=["GET"], raise_on_status=False)
-    session = requests.Session()
-    session.mount("https://", HTTPAdapter(max_retries=retry))
-    session.headers.update({"User-Agent": "VeroValidacaoEnderecos/3.0"})
-    data_consulta = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-    try:
-        with _brasilapi_sem:
-            resp = session.get(url, timeout=20)
-            time.sleep(0.35)
-        if resp.status_code != 200:
-            return {"cnpj": cnpj, "data_consulta": data_consulta,
-                    "status_consulta": f"erro_http_{resp.status_code}"}
-        p = resp.json()
-        cep_raw = (p.get("cep") or "").replace("-", "").replace(".", "").strip()
-        return {
-            "cnpj":                      cnpj,
-            "razao_social":              p.get("razao_social"),
-            "nome_fantasia":             p.get("nome_fantasia"),
-            "situacao_cadastral":        p.get("descricao_situacao_cadastral"),
-            "data_situacao_cadastral":   p.get("data_situacao_cadastral"),
-            "motivo_situacao_cadastral": p.get("descricao_motivo_situacao_cadastral"),
-            "natureza_juridica":         p.get("descricao_natureza_juridica"),
-            "data_inicio_atividade":     p.get("data_inicio_atividade"),
-            "cnae_principal_codigo":     p.get("cnae_fiscal"),
-            "cnae_principal_descricao":  p.get("cnae_fiscal_descricao"),
-            "porte":                     p.get("descricao_porte"),
-            "capital_social":            p.get("capital_social"),
-            "opcao_simples":             p.get("opcao_pelo_simples"),
-            "opcao_mei":                 p.get("opcao_pelo_mei"),
-            "email":                     p.get("email"),
-            "telefone":                  p.get("ddd_telefone_1"),
-            "receita_cep":               cep_raw.zfill(8) if cep_raw else None,
-            "receita_logradouro":        p.get("logradouro"),
-            "receita_numero":            p.get("numero"),
-            "receita_complemento":       p.get("complemento"),
-            "receita_bairro":            p.get("bairro"),
-            "receita_municipio":         p.get("municipio"),
-            "receita_uf":                p.get("uf"),
-            "data_consulta":             data_consulta,
-            "status_consulta":           "ok",
-        }
-    except requests.Timeout:
-        return {"cnpj": cnpj, "data_consulta": data_consulta, "status_consulta": "timeout"}
-    except requests.RequestException as exc:
-        return {"cnpj": cnpj, "data_consulta": data_consulta,
-                "status_consulta": f"erro_rede: {str(exc)[:120]}"}
-    finally:
-        session.close()
-
-
-def _limpar_rec_receita(r: dict) -> dict:
-    limpo: dict = {}
-    for campo in [f.name for f in _SCHEMA_RECEITA.fields]:
-        v = r.get(campo)
-        if isinstance(v, str) and v in _VAZIOS_RECEITA:
-            v = None
-        if campo == "cnae_principal_codigo" and v is not None:
-            try:
-                v = int(v)
-            except (TypeError, ValueError):
-                v = None
-        elif campo == "capital_social" and v is not None:
-            try:
-                v = float(v)
-            except (TypeError, ValueError):
-                v = None
-        elif campo in ("opcao_simples", "opcao_mei"):
-            if isinstance(v, bool):
-                pass
-            elif v is None or str(v).lower() in _VAZIOS_RECEITA:
-                v = None
-            elif str(v).lower() in ("true", "1", "sim"):
-                v = True
-            else:
-                v = False
-        limpo[campo] = v
-    return limpo
-
-
 def _cnpj_valido(cnpj: str) -> bool:
     """Valida CNPJ pelo algoritmo dos dígitos verificadores."""
     if len(cnpj) != 14 or cnpj == cnpj[0] * 14:
@@ -344,68 +290,220 @@ def _cnpj_valido(cnpj: str) -> bool:
     return True
 
 
-# --- Extrai CNPJs distintos usando Spark (sem .toPandas()) ---
-_cnpj_rows = (
-    sdf
-    .select(F.regexp_replace(F.col("CPF_CNPJ"), r"\D", "").alias("doc_clean"))
-    .filter(F.length(F.col("doc_clean")) == 14)
-    .distinct()
-    .collect()
-)
-_cnpjs_raw: set[str] = {r["doc_clean"] for r in _cnpj_rows}
-
-cnpjs_lote: set[str] = {c for c in _cnpjs_raw if _cnpj_valido(c)}
-invalidos_cnpj = len(_cnpjs_raw) - len(cnpjs_lote)
-if invalidos_cnpj:
-    print(f"  {invalidos_cnpj} CNPJ(s) com dígito verificador inválido ignorados.")
-
-ja_ok: set[str] = {
-    r["cnpj"]
-    for r in spark.sql(
-        f"SELECT cnpj FROM {TABELA_RECEITA} WHERE status_consulta = 'ok'"
-    ).collect()
+# ---------------------------------------------------------------------------
+# Tradução: alias do MAPA_COLUNAS → nome real da coluna em tab_dados_receita
+# Necessário porque MAPA_COLUNAS usa rótulos legíveis (ex: "CEP", "CNAE_FISCAL")
+# enquanto o schema da tabela usa nomes técnicos (ex: "receita_cep", "cnae_principal_codigo").
+# ---------------------------------------------------------------------------
+_TARGET_TO_SCHEMA = {
+    "CNPJ":                     "cnpj",
+    "RAZAO_SOCIAL":              "razao_social",
+    "NOME_FANTASIA":             "nome_fantasia",
+    "SITUACAO_CADASTRAL":        "situacao_cadastral",
+    "DATA_SITUACAO_CADASTRAL":   "data_situacao_cadastral",
+    "MOTIVO_SITUACAO_CADASTRAL": "motivo_situacao_cadastral",
+    "NATUREZA_JURIDICA":         "natureza_juridica",
+    "DATA_INICIO_ATIVIDADE":     "data_inicio_atividade",
+    "CNAE_FISCAL":               "cnae_principal_codigo",
+    "CNAE_FISCAL_DESCRICAO":     "cnae_principal_descricao",
+    "PORTE":                     "porte",
+    "CAPITAL_SOCIAL":            "capital_social",
+    "OPCAO_SIMPLES":             "opcao_simples",
+    "OPCAO_MEI":                 "opcao_mei",
+    "EMAIL":                     "email",
+    "TELEFONE":                  "telefone",
+    "CEP":                       "receita_cep",
+    "LOGRADOURO":                "receita_logradouro",
+    "NUMERO":                    "receita_numero",
+    "COMPLEMENTO":               "receita_complemento",
+    "BAIRRO":                    "receita_bairro",
+    "MUNICIPIO":                 "receita_municipio",
+    "UF":                        "receita_uf",
 }
 
-cnpjs_buscar = sorted(cnpjs_lote - ja_ok)
+# Mapeamento invertido e resolvido: dump_col -> schema_field_name
+_DUMP_COL_TO_SCHEMA: dict[str, str] = {}
+for _dump_col, _target_alias in MAPA_COLUNAS.items():
+    _schema_field = _TARGET_TO_SCHEMA.get(_target_alias.upper())
+    if _schema_field:
+        _DUMP_COL_TO_SCHEMA[_dump_col] = _schema_field
+
+# ---------------------------------------------------------------------------
+# 1. Carrega o arquivo dump
+# ---------------------------------------------------------------------------
+if FORMATO_DUMP == "csv":
+    df_dump = (
+        spark.read
+        .option("header", "true")
+        .option("sep", SEP_CSV)
+        .option("encoding", "latin1")
+        .csv(ARQUIVO_DUMP_RECEITA)
+    )
+elif FORMATO_DUMP == "parquet":
+    df_dump = spark.read.parquet(ARQUIVO_DUMP_RECEITA)
+elif FORMATO_DUMP == "delta":
+    df_dump = spark.read.table(ARQUIVO_DUMP_RECEITA)
+else:
+    raise ValueError(
+        f"FORMATO_DUMP inválido: '{FORMATO_DUMP}'. Use 'csv', 'parquet' ou 'delta'."
+    )
+
+_dump_cols_set = set(df_dump.columns)
+_n_dump_total = df_dump.count()
 print(
-    f"CNPJs na base-fonte: {len(_cnpjs_raw)} | Válidos: {len(cnpjs_lote)} | "
-    f"Já na tabela (ok): {len(ja_ok)} | A buscar na API: {len(cnpjs_buscar)}"
+    f"Dump carregado: {_n_dump_total:,} registros | "
+    f"Formato: {FORMATO_DUMP} | Arquivo: {ARQUIVO_DUMP_RECEITA}"
 )
 
-if cnpjs_buscar:
-    t0 = time.time()
-    novos: list[dict] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-        futures = {executor.submit(_consultar_receita_api, cnpj): cnpj for cnpj in cnpjs_buscar}
-        for i, future in enumerate(concurrent.futures.as_completed(futures), 1):
-            cnpj = futures[future]
-            try:
-                rec = future.result()
-                novos.append(rec)
-                if rec.get("status_consulta") != "ok":
-                    print(f"  [ERRO] {cnpj} — {rec.get('status_consulta')}")
-            except Exception as exc:
-                novos.append({"cnpj": cnpj, "status_consulta": f"excecao: {exc}",
-                              "data_consulta": datetime.now().strftime("%Y-%m-%dT%H:%M:%S")})
-            if i % 50 == 0 or i == len(cnpjs_buscar):
-                print(f"  {i}/{len(cnpjs_buscar)} CNPJs consultados ({time.time() - t0:.0f}s)")
+# ---------------------------------------------------------------------------
+# 2. Identifica coluna CNPJ no dump e normaliza (remove máscara, zpad 14)
+# ---------------------------------------------------------------------------
+_cnpj_dump_col = None
+for _dc, _schema_f in _DUMP_COL_TO_SCHEMA.items():
+    if _schema_f == "cnpj" and _dc in _dump_cols_set:
+        _cnpj_dump_col = _dc
+        break
 
-    df_novos = spark.createDataFrame(
-        [_limpar_rec_receita(r) for r in novos], schema=_SCHEMA_RECEITA
+if _cnpj_dump_col is None:
+    raise ValueError(
+        "Coluna CNPJ não encontrada no dump. "
+        "Verifique a chave mapeada para 'CNPJ' em MAPA_COLUNAS e o schema do arquivo."
     )
+
+df_dump = df_dump.withColumn(
+    "_cnpj_norm",
+    F.lpad(F.regexp_replace(F.col(_cnpj_dump_col), r"\D", ""), 14, "0"),
+)
+
+# ---------------------------------------------------------------------------
+# 3. Extrai CNPJs distintos da base de clientes (sdf)
+# ---------------------------------------------------------------------------
+_cnpjs_base_sdf = (
+    sdf
+    .select(
+        F.lpad(
+            F.regexp_replace(F.col("CPF_CNPJ"), r"\D", ""), 14, "0"
+        ).alias("cnpj_base")
+    )
+    .filter(F.length(F.col("cnpj_base")) == 14)
+    .distinct()
+)
+
+# ---------------------------------------------------------------------------
+# 4. Filtra dump: apenas CNPJs que existem na base de clientes (semi-join)
+# ---------------------------------------------------------------------------
+df_dump_filtrado = (
+    df_dump
+    .join(_cnpjs_base_sdf, on=F.col("_cnpj_norm") == F.col("cnpj_base"), how="inner")
+    .drop("cnpj_base")
+)
+
+_n_match = df_dump_filtrado.count()
+print(f"CNPJs do dump presentes na base de clientes: {_n_match:,}")
+
+# ---------------------------------------------------------------------------
+# 5. Incremental: exclui CNPJs já gravados com status_consulta = 'ok'
+# ---------------------------------------------------------------------------
+_ja_ok_sdf = spark.sql(
+    f"SELECT cnpj AS cnpj_ok FROM {TABELA_RECEITA} WHERE status_consulta = 'ok'"
+)
+
+df_novos = (
+    df_dump_filtrado
+    .join(_ja_ok_sdf, on=F.col("_cnpj_norm") == F.col("cnpj_ok"), how="left_anti")
+)
+_n_a_merge = df_novos.count()
+_n_ja_ok   = _n_match - _n_a_merge
+print(
+    f"Já em tab_dados_receita (ok): {_n_ja_ok:,} | "
+    f"A processar via MERGE: {_n_a_merge:,}"
+)
+
+# ---------------------------------------------------------------------------
+# 6. Constrói select com renomeação + cast para cada campo do schema
+# ---------------------------------------------------------------------------
+_BOOL_TRUE_VALS  = {"S", "SIM", "1", "TRUE",  "T", "VERDADEIRO"}
+_BOOL_FALSE_VALS = {"N", "NAO", "NÃO", "0", "FALSE", "F", "FALSO"}
+
+_select_exprs = []
+for _field in _SCHEMA_RECEITA.fields:
+    _fname = _field.name
+    if _fname in ("data_consulta", "status_consulta"):
+        continue  # adicionados depois
+
+    _dump_col = next(
+        (dc for dc, sf in _DUMP_COL_TO_SCHEMA.items() if sf == _fname), None
+    )
+
+    if _fname == "cnpj":
+        # Usa o CNPJ já normalizado (sem máscara, 14 dígitos, zpad)
+        _select_exprs.append(F.col("_cnpj_norm").alias("cnpj"))
+        continue
+
+    if _dump_col and _dump_col in _dump_cols_set:
+        # Normaliza strings vazias/nulas para NULL
+        _raw = F.when(
+            F.trim(F.col(_dump_col)).isin(list(_VAZIOS_RECEITA))
+            | F.col(_dump_col).isNull()
+            | (F.trim(F.col(_dump_col)) == ""),
+            F.lit(None).cast(StringType()),
+        ).otherwise(F.trim(F.col(_dump_col)))
+
+        if _fname == "cnae_principal_codigo":
+            _expr = F.regexp_replace(_raw, r"\D", "").cast(LongType())
+        elif _fname == "capital_social":
+            _expr = _raw.cast(DoubleType())
+        elif _fname in ("opcao_simples", "opcao_mei"):
+            _expr = (
+                F.when(F.upper(_raw).isin(list(_BOOL_TRUE_VALS)),  F.lit(True))
+                 .when(F.upper(_raw).isin(list(_BOOL_FALSE_VALS)), F.lit(False))
+                 .otherwise(F.lit(None).cast(BooleanType()))
+            )
+        else:
+            _expr = _raw.cast(StringType())
+    else:
+        # Coluna ausente no dump — preenche com NULL do tipo correto
+        _expr = F.lit(None).cast(_field.dataType)
+
+    _select_exprs.append(_expr.alias(_fname))
+
+# Adiciona colunas geradas
+df_para_merge = (
+    df_novos
+    .select(_select_exprs)
+    .withColumn(
+        "data_consulta",
+        F.date_format(F.current_timestamp(), "yyyy-MM-dd'T'HH:mm:ss"),
+    )
+    .withColumn("status_consulta", F.lit("ok"))
+)
+
+# ---------------------------------------------------------------------------
+# 7. MERGE incremental em tab_dados_receita via DeltaTable
+# ---------------------------------------------------------------------------
+if _n_a_merge > 0:
     (
         DeltaTable.forName(spark, TABELA_RECEITA)
         .alias("t")
-        .merge(df_novos.alias("n"), "t.cnpj = n.cnpj")
+        .merge(df_para_merge.alias("n"), "t.cnpj = n.cnpj")
         .whenMatchedUpdateAll()
         .whenNotMatchedInsertAll()
         .execute()
     )
-    ok_novos  = sum(1 for r in novos if r.get("status_consulta") == "ok")
-    err_novos = len(novos) - ok_novos
-    print(f"MERGE concluído: {ok_novos} gravados OK | {err_novos} com erro | {time.time() - t0:.1f}s")
+    print(f"MERGE concluído: {_n_a_merge:,} registros inseridos/atualizados.")
 else:
-    print("Todos os CNPJs do lote já estão na tabela. Nenhuma chamada à API necessária.")
+    print("Todos os CNPJs do lote já estão na tabela. Nenhum MERGE necessário.")
+
+# ---------------------------------------------------------------------------
+# 8. Sumário
+# ---------------------------------------------------------------------------
+print(
+    f"\nResumo — Receita Federal (dump):"
+    f"\n  Registros no dump:             {_n_dump_total:,}"
+    f"\n  Correspondentes na base:       {_n_match:,}"
+    f"\n  Já gravados com status ok:     {_n_ja_ok:,}"
+    f"\n  Enviados ao MERGE:             {_n_a_merge:,}"
+)
 
 # COMMAND ----------
 
@@ -1417,20 +1515,9 @@ for _tbl, _col in [
     except Exception:
         pass
 
-def _sem_strings_vazias(df):
-    """Converte '' para NULL em colunas STRING — evita CAST_INVALID_INPUT em ANSI mode."""
-    from pyspark.sql.types import StringType
-    return df.select([
-        F.when(F.col(c) == "", F.lit(None).cast(df.schema[c].dataType))
-         .otherwise(F.col(c)).alias(c)
-        if isinstance(df.schema[c].dataType, StringType)
-        else F.col(c).alias(c)
-        for c in df.columns
-    ])
-
 # Grava as 3 tabelas de output
 (
-    _sem_strings_vazias(validacao_enderecos)
+    validacao_enderecos
     .write
     .mode("append")
     .option("mergeSchema", "true")
@@ -1438,7 +1525,7 @@ def _sem_strings_vazias(df):
 )
 
 (
-    _sem_strings_vazias(validacao_dados_cadastrais)
+    validacao_dados_cadastrais
     .write
     .mode("append")
     .option("mergeSchema", "true")
@@ -1446,7 +1533,7 @@ def _sem_strings_vazias(df):
 )
 
 (
-    _sem_strings_vazias(validacao_status_fatura)
+    validacao_status_fatura
     .write
     .mode("append")
     .option("mergeSchema", "true")

@@ -3,13 +3,17 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC # Validação de Endereços e Dados Cadastrais — V3
+# MAGIC # Validação de Endereços e Dados Cadastrais — V5
 # MAGIC
-# MAGIC **Diferença vs V2:** pipeline reescrito em Spark nativo — sem `.toPandas()` no DataFrame principal.
+# MAGIC **Diferença vs V3:** suporte a duas fontes para consulta de dados da Receita Federal.
 # MAGIC
-# MAGIC **Arquitetura V3:**
+# MAGIC **Modo automático por token:**
+# MAGIC - `SERPRO_TOKEN` preenchido → consulta SERPRO Consulta CNPJ (paralelo direto, sem rate-limit)
+# MAGIC - `SERPRO_TOKEN` vazio → consulta BrasilAPI gratuita (`Semaphore(1)` + `sleep(0.35 s/req)`)
+# MAGIC
+# MAGIC **Arquitetura V5:**
 # MAGIC ```
-# MAGIC spark.sql() → cache() → JOIN tab_dados_receita + tab_dados_cep → CASE WHEN columns → SELECT por tabela → write
+# MAGIC spark.sql() → JOIN tab_dados_receita + tab_dados_cep → CASE WHEN columns → SELECT por tabela → write
 # MAGIC ```
 # MAGIC
 # MAGIC **Saída (tabelas Delta):**
@@ -48,7 +52,7 @@ from pyspark.sql.types import (
 )
 
 
-print("V3 — Processamento nativo Spark (sem .toPandas())")
+print("V5 — Processamento nativo Spark (sem .toPandas()) | Dual-source: SERPRO / BrasilAPI")
 
 spark = SparkSession.getActiveSession()
 
@@ -62,12 +66,23 @@ try:
 except Exception:
     TOKEN = ""
 
+# SERPRO — Consulta CNPJ (deixe vazio "" para usar BrasilAPI gratuita)
+# Obtenha em: https://servicos.serpro.gov.br → Consulta CNPJ
+SERPRO_TOKEN = ""   # ex: "Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9..."
+
+_USAR_SERPRO = bool(SERPRO_TOKEN and SERPRO_TOKEN.strip())
+print(f"Fonte Receita: {'SERPRO (sem rate-limit)' if _USAR_SERPRO else 'BrasilAPI (Semaphore 1, 0.35s/req)'}")
+
 CATALOG        = "hive_metastore.accenture"
 TABELA_RECEITA = f"{CATALOG}.tab_dados_receita"
 TABELA_CEP     = f"{CATALOG}.tab_dados_cep"
 
 # Limite de registros para processar. None = sem limite (produção).
 LIMIT_REGISTROS = None  # ex: 1000 para teste
+
+# Retry config para sessões HTTP
+MAX_RETRIES = 4
+BACKOFF     = 1.5
 
 # BrasilAPI: 1 chamada simultânea para evitar 429
 _brasilapi_sem = threading.Semaphore(1)
@@ -247,19 +262,133 @@ _SCHEMA_RECEITA = StructType([
 _VAZIOS_RECEITA = {"", "nan", "NaN", "None", "none", "null", "NULL", "NaT", "na", "NA"}
 
 
-def _consultar_receita_api(cnpj: str) -> dict:
-    """Consulta BrasilAPI e retorna dict normalizado para gravar no Delta."""
-    url = f"https://brasilapi.com.br/api/cnpj/v1/{quote(cnpj)}"
-    retry = Retry(total=4, backoff_factor=1.5, status_forcelist=[429, 500, 502, 503, 504],
+def _cnpj_valido(cnpj: str) -> bool:
+    """Valida CNPJ pelo algoritmo dos dígitos verificadores."""
+    if len(cnpj) != 14 or cnpj == cnpj[0] * 14:
+        return False
+    for pesos, pos in (([5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2], 12),
+                       ([6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2], 13)):
+        soma = sum(int(cnpj[i]) * pesos[i] for i in range(pos))
+        resto = soma % 11
+        dv = 0 if resto < 2 else 11 - resto
+        if dv != int(cnpj[pos]):
+            return False
+    return True
+
+
+def _limpar_rec_receita(r: dict) -> dict:
+    limpo: dict = {}
+    for campo in [f.name for f in _SCHEMA_RECEITA.fields]:
+        v = r.get(campo)
+        if isinstance(v, str) and v in _VAZIOS_RECEITA:
+            v = None
+        if campo == "cnae_principal_codigo" and v is not None:
+            try:
+                v = int(v)
+            except (TypeError, ValueError):
+                v = None
+        elif campo == "capital_social" and v is not None:
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                v = None
+        elif campo in ("opcao_simples", "opcao_mei"):
+            if isinstance(v, bool):
+                pass
+            elif v is None or str(v).lower() in _VAZIOS_RECEITA:
+                v = None
+            elif str(v).lower() in ("true", "1", "sim"):
+                v = True
+            else:
+                v = False
+        limpo[campo] = v
+    return limpo
+
+
+def _nova_sessao() -> requests.Session:
+    retry = Retry(total=MAX_RETRIES, backoff_factor=BACKOFF,
+                  status_forcelist=[429, 500, 502, 503, 504],
                   allowed_methods=["GET"], raise_on_status=False)
-    session = requests.Session()
-    session.mount("https://", HTTPAdapter(max_retries=retry))
-    session.headers.update({"User-Agent": "VeroValidacaoEnderecos/3.0"})
+    s = requests.Session()
+    s.mount("https://", HTTPAdapter(max_retries=retry))
+    if _USAR_SERPRO:
+        _tok = SERPRO_TOKEN.strip()
+        s.headers.update({
+            "Authorization": _tok if _tok.lower().startswith("bearer ") else f"Bearer {_tok}",
+            "Accept": "application/json",
+            "User-Agent": "VeroValidacaoReceita/5.0",
+        })
+    else:
+        s.headers.update({"User-Agent": "VeroValidacaoReceita/5.0"})
+    return s
+
+
+def _consultar_serpro(cnpj: str, session: requests.Session) -> dict[str, Any]:
+    """Consulta SERPRO Consulta CNPJ e retorna dict normalizado para tab_dados_receita."""
+    url = f"https://gateway.apiserpro.serpro.gov.br/consulta-cnpj/v1/basica/{cnpj}"
     data_consulta = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     try:
-        with _brasilapi_sem:
-            resp = session.get(url, timeout=20)
-            time.sleep(0.35)
+        resp = session.get(url, timeout=20)
+        if resp.status_code != 200:
+            return {"cnpj": cnpj, "data_consulta": data_consulta,
+                    "status_consulta": f"erro_http_{resp.status_code}"}
+        p = resp.json()
+        # Endereço: pega o primeiro item de "enderecos" com tipo "ESTABELECIMENTO" ou qualquer um
+        _enderecos = p.get("enderecos") or []
+        _end = next((e for e in _enderecos if e.get("tipo") == "ESTABELECIMENTO"),
+                    _enderecos[0] if _enderecos else {})
+        _cep_raw = re.sub(r"\D", "", str(_end.get("cep") or ""))
+        _telefones = p.get("telefones") or []
+        _tel = f"{_telefones[0].get('ddd','')}{_telefones[0].get('numero','')}" if _telefones else None
+        _cnae = p.get("cnaePrincipal") or {}
+        _sit  = p.get("situacaoCadastral") or {}
+        _nat  = p.get("naturezaJuridica") or {}
+        _porte = p.get("porte") or {}
+        # capital social vem como string "1000000.00"
+        _cap = p.get("capitalSocial")
+        try:
+            _cap = float(str(_cap).replace(",", ".")) if _cap else None
+        except (ValueError, TypeError):
+            _cap = None
+        return {
+            "cnpj":                      cnpj,
+            "razao_social":              p.get("nomeEmpresarial"),
+            "nome_fantasia":             p.get("nomeFantasia"),
+            "situacao_cadastral":        _sit.get("descricao") or _sit.get("codigo"),
+            "data_situacao_cadastral":   _sit.get("data"),
+            "motivo_situacao_cadastral": _sit.get("motivo"),
+            "natureza_juridica":         _nat.get("descricao") or _nat.get("codigo"),
+            "data_inicio_atividade":     p.get("dataAbertura"),
+            "cnae_principal_codigo":     re.sub(r"\D", "", str(_cnae.get("codigo") or "")) or None,
+            "cnae_principal_descricao":  _cnae.get("descricao"),
+            "porte":                     _porte.get("descricao") or _porte.get("codigo"),
+            "capital_social":            _cap,
+            "opcao_simples":             None,  # SERPRO básica não retorna Simples
+            "opcao_mei":                 None,
+            "email":                     p.get("correioEletronico"),
+            "telefone":                  _tel,
+            "receita_cep":               _cep_raw.zfill(8) if len(_cep_raw) >= 7 else None,
+            "receita_logradouro":        _end.get("logradouro"),
+            "receita_numero":            _end.get("numero"),
+            "receita_complemento":       _end.get("complemento"),
+            "receita_bairro":            _end.get("bairro"),
+            "receita_municipio":         (_end.get("municipio") or {}).get("descricao") or _end.get("municipio"),
+            "receita_uf":                _end.get("uf"),
+            "data_consulta":             data_consulta,
+            "status_consulta":           "ok",
+        }
+    except requests.Timeout:
+        return {"cnpj": cnpj, "data_consulta": data_consulta, "status_consulta": "timeout"}
+    except requests.RequestException as exc:
+        return {"cnpj": cnpj, "data_consulta": data_consulta, "status_consulta": f"erro_rede: {str(exc)[:120]}"}
+
+
+def _consultar_brasilapi(cnpj: str, session: requests.Session) -> dict[str, Any]:
+    """Consulta BrasilAPI e retorna dict normalizado para gravar no Delta."""
+    url = f"https://brasilapi.com.br/api/cnpj/v1/{quote(cnpj)}"
+    data_consulta = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        resp = session.get(url, timeout=20)
         if resp.status_code != 200:
             return {"cnpj": cnpj, "data_consulta": data_consulta,
                     "status_consulta": f"erro_http_{resp.status_code}"}
@@ -297,51 +426,30 @@ def _consultar_receita_api(cnpj: str) -> dict:
     except requests.RequestException as exc:
         return {"cnpj": cnpj, "data_consulta": data_consulta,
                 "status_consulta": f"erro_rede: {str(exc)[:120]}"}
+
+
+def _consultar_receita(cnpj: str, session: requests.Session) -> dict[str, Any]:
+    """Roteador: usa SERPRO se token configurado, BrasilAPI caso contrário."""
+    if _USAR_SERPRO:
+        return _consultar_serpro(cnpj, session)
+    else:
+        return _consultar_brasilapi(cnpj, session)
+
+
+def _worker(cnpj: str) -> dict[str, Any]:
+    session = _nova_sessao()
+    try:
+        if _USAR_SERPRO:
+            # SERPRO: sem rate-limit, paralelo direto
+            return _consultar_receita(cnpj, session)
+        else:
+            # BrasilAPI: serializa via semáforo + throttle
+            with _brasilapi_sem:
+                result = _consultar_receita(cnpj, session)
+                time.sleep(0.35)
+            return result
     finally:
         session.close()
-
-
-def _limpar_rec_receita(r: dict) -> dict:
-    limpo: dict = {}
-    for campo in [f.name for f in _SCHEMA_RECEITA.fields]:
-        v = r.get(campo)
-        if isinstance(v, str) and v in _VAZIOS_RECEITA:
-            v = None
-        if campo == "cnae_principal_codigo" and v is not None:
-            try:
-                v = int(v)
-            except (TypeError, ValueError):
-                v = None
-        elif campo == "capital_social" and v is not None:
-            try:
-                v = float(v)
-            except (TypeError, ValueError):
-                v = None
-        elif campo in ("opcao_simples", "opcao_mei"):
-            if isinstance(v, bool):
-                pass
-            elif v is None or str(v).lower() in _VAZIOS_RECEITA:
-                v = None
-            elif str(v).lower() in ("true", "1", "sim"):
-                v = True
-            else:
-                v = False
-        limpo[campo] = v
-    return limpo
-
-
-def _cnpj_valido(cnpj: str) -> bool:
-    """Valida CNPJ pelo algoritmo dos dígitos verificadores."""
-    if len(cnpj) != 14 or cnpj == cnpj[0] * 14:
-        return False
-    for pesos, pos in (([5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2], 12),
-                       ([6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2], 13)):
-        soma = sum(int(cnpj[i]) * pesos[i] for i in range(pos))
-        resto = soma % 11
-        dv = 0 if resto < 2 else 11 - resto
-        if dv != int(cnpj[pos]):
-            return False
-    return True
 
 
 # --- Extrai CNPJs distintos usando Spark (sem .toPandas()) ---
@@ -376,7 +484,7 @@ if cnpjs_buscar:
     t0 = time.time()
     novos: list[dict] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-        futures = {executor.submit(_consultar_receita_api, cnpj): cnpj for cnpj in cnpjs_buscar}
+        futures = {executor.submit(_worker, cnpj): cnpj for cnpj in cnpjs_buscar}
         for i, future in enumerate(concurrent.futures.as_completed(futures), 1):
             cnpj = futures[future]
             try:

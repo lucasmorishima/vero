@@ -152,8 +152,8 @@ print(f"Tabelas prontas: '{TABELA_RECEITA}' | '{TABELA_CEP}'")
 # COMMAND ----------
 
 _QUERY = """
-SELECT
-    ROW_NUMBER() OVER (ORDER BY bc.codigocliente) + 1 AS FATURA,
+SELECT     TRY_CAST(REGEXP_REPLACE(ca.fatura_numero, '[^0-9]', '') AS BIGINT) AS FATURA,
+    ca.fatura_numero                                                   AS NUMERO_FATURA,
     COALESCE(ca.CONTRATO, ca.ID_CLIENTE)               AS ID_CLIENTE_CONTRATO,
     ca.segmento                                        AS SEGMENTO,
 
@@ -178,17 +178,47 @@ SELECT
     ''                                       AS TIPO_IMPOSTO,
     ''                                       AS PROMOCAO,
     ''                                       AS GRUPO_LOCALIDADE,
-    date_format(current_date(), 'yyyy_MM')   AS ID_LOTE,
+    date_format(current_date(), 'yyyy-MM')   AS ID_LOTE,
     ca.sistema_origem                        AS CRM
-FROM hive_metastore.accenture.base_clientes_centralizada bc
-LEFT JOIN hive_metastore.accenture.tb_dispersao_competencia_analitica ca
-    ON (
-        (bc.crm = 'NG' AND ca.ID_CLIENTE = bc.codigocliente)
-        OR
-        (bc.crm <> 'NG' AND ca.CONTRATO = bc.idcontrato)
-    )
+FROM accenture.base_clientes_centralizada bc
+INNER JOIN accenture.tb_dispersao_competencia_analitica ca
+    ON bc.idcontrato = ca.CONTRATO
+WHERE bc.crm <> 'NG'
+
+UNION ALL
+
+SELECT TRY_CAST(REGEXP_REPLACE(ca.fatura_numero, '[^0-9]', '') AS BIGINT) AS FATURA,
+    ca.fatura_numero                                                   AS NUMERO_FATURA,
+    COALESCE(ca.CONTRATO, ca.ID_CLIENTE)               AS ID_CLIENTE_CONTRATO,
+    ca.segmento                                        AS SEGMENTO,
+
+    -- Endereço de instalação
+    bc.cidade   AS cidade_instalacao,
+    bc.bairro   AS bairro_instalacao,
+    bc.cep      AS cep_instalacao,
+    bc.uf       AS uf_instalacao,
+
+    -- Endereço legal (cobrança / cadastro)
+    bc.cidade   AS cidade_legal,
+    bc.bairro   AS bairro_legal,
+    bc.cep      AS cep_legal,
+    bc.uf       AS uf_legal,
+
+    ca.CPF_CNPJ                              AS CPF_CNPJ,
+    ca.NOME_CLIENTE                          AS NOME_CLIENTE,
+    ''                                       AS INSCRICAO_ESTADUAL,
+    bc.nome_produto                          AS PRODUTO,
+    ''                                       AS TIPO_SERVICO,
+    ''                                       AS DESCRICAO_SERVICO,
+    ''                                       AS TIPO_IMPOSTO,
+    ''                                       AS PROMOCAO,
+    ''                                       AS GRUPO_LOCALIDADE,
+    date_format(current_date(), 'yyyy-MM')   AS ID_LOTE,
+    ca.sistema_origem                        AS CRM
+FROM accenture.base_clientes_centralizada bc
+INNER JOIN accenture.tb_dispersao_competencia_analitica ca
+    ON bc.codigocliente = ca.ID_CLIENTE
 WHERE bc.crm = 'NG'
-  AND ca.CPF_CNPJ IS NOT NULL
 """
 
 if LIMIT_REGISTROS:
@@ -217,7 +247,8 @@ print(
     f"{_total} registros carregados — "
     f"CPF: {_cnts.get('CPF', 0)} | "
     f"CNPJ: {_cnts.get('CNPJ', 0)} | "
-    f"INVALIDO: {_cnts.get('INVALIDO', 0)}"
+    f"INVALIDO: {_cnts.get('INVALIDO', 0)} | "
+    f"NULO: {_cnts.get('NULO', 0)}"
 )
 if _cnts.get("CNPJ", 0) == 0:
     print("  AVISO: nenhum CNPJ no lote — DADOS_CADASTRAIS não será gerado.")
@@ -536,41 +567,67 @@ _SCHEMA_CEP = StructType([
 
 
 def _buscar_cep_api(cep: str) -> dict:
-    """Consulta ViaCEP (fallback Correios) e retorna dict normalizado para Delta."""
+    """Consulta CEP em cascata: Correios API → ViaCEP → BrasilAPI → OpenCEP."""
     data_consulta = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-    try:
-        if TOKEN:
-            try:
-                r = requests.get(
-                    f"https://api.correios.com.br/cep/v2/{cep}",
-                    headers={"Authorization": f"Bearer {TOKEN}"},
-                    timeout=10,
-                )
-                r.raise_for_status()
-                d = r.json()
-                return {"cep": cep, "logradouro": d.get("logradouro", ""),
-                        "bairro": d.get("bairro", ""), "cidade": d.get("localidade", ""),
-                        "uf": d.get("uf", ""), "complemento": d.get("complemento", ""),
-                        "fonte": "Correios API", "data_consulta": data_consulta,
-                        "status_consulta": "ok"}
-            except Exception:
-                pass  # fallback para ViaCEP
 
+    def _ok(fonte, d_logradouro="", d_bairro="", d_cidade="", d_uf="", d_complemento=""):
+        return {"cep": cep, "logradouro": d_logradouro, "bairro": d_bairro,
+                "cidade": d_cidade, "uf": d_uf, "complemento": d_complemento,
+                "fonte": fonte, "data_consulta": data_consulta, "status_consulta": "ok"}
+
+    # 1. Correios API (apenas se TOKEN configurado)
+    if TOKEN:
+        try:
+            r = requests.get(
+                f"https://api.correios.com.br/cep/v2/{cep}",
+                headers={"Authorization": f"Bearer {TOKEN}"},
+                timeout=10,
+            )
+            r.raise_for_status()
+            d = r.json()
+            return _ok("Correios API",
+                       d.get("logradouro", ""), d.get("bairro", ""),
+                       d.get("localidade", ""), d.get("uf", ""), d.get("complemento", ""))
+        except Exception:
+            pass
+
+    # 2. ViaCEP
+    try:
         r = requests.get(f"https://viacep.com.br/ws/{cep}/json/", timeout=10)
         r.raise_for_status()
         d = r.json()
-        if d.get("erro"):
-            return {"cep": cep, "data_consulta": data_consulta, "status_consulta": "nao_encontrado"}
-        return {"cep": cep, "logradouro": d.get("logradouro", ""),
-                "bairro": d.get("bairro", ""), "cidade": d.get("localidade", ""),
-                "uf": d.get("uf", ""), "complemento": d.get("complemento", ""),
-                "fonte": "ViaCEP", "data_consulta": data_consulta,
-                "status_consulta": "ok"}
-    except requests.Timeout:
-        return {"cep": cep, "data_consulta": data_consulta, "status_consulta": "timeout"}
-    except requests.RequestException as exc:
-        return {"cep": cep, "data_consulta": data_consulta,
-                "status_consulta": f"erro_rede: {str(exc)[:120]}"}
+        if not d.get("erro"):
+            return _ok("ViaCEP",
+                       d.get("logradouro", ""), d.get("bairro", ""),
+                       d.get("localidade", ""), d.get("uf", ""), d.get("complemento", ""))
+    except Exception:
+        pass
+
+    # 3. BrasilAPI CEP v2 (agrega Correios + ViaCEP + outros)
+    try:
+        r = requests.get(f"https://brasilapi.com.br/api/cep/v2/{cep}", timeout=10)
+        r.raise_for_status()
+        d = r.json()
+        if d.get("cep"):
+            return _ok("BrasilAPI",
+                       d.get("street", ""), d.get("neighborhood", ""),
+                       d.get("city", ""), d.get("state", ""), "")
+    except Exception:
+        pass
+
+    # 4. OpenCEP
+    try:
+        r = requests.get(f"https://opencep.com/v1/{cep}", timeout=10)
+        r.raise_for_status()
+        d = r.json()
+        if d.get("cep"):
+            return _ok("OpenCEP",
+                       d.get("logradouro", ""), d.get("bairro", ""),
+                       d.get("localidade", ""), d.get("uf", ""), d.get("complemento", ""))
+    except Exception:
+        pass
+
+    return {"cep": cep, "data_consulta": data_consulta, "status_consulta": "nao_encontrado"}
 
 
 # --- Extrai CEPs distintos usando Spark (sem .toPandas()) ---
@@ -741,6 +798,10 @@ receita_lkp  = _receita_raw.select(
 )
 
 _cep_raw     = spark.sql(f"SELECT * FROM {TABELA_CEP} WHERE status_consulta = 'ok'")
+# Normaliza a chave de join do cache (mesmo padrão de _cep_inst_norm: só dígitos, lpad 8)
+_cep_raw     = _cep_raw.withColumn(
+    "cep", F.lpad(F.regexp_replace(F.col("cep"), r"\D", ""), 8, "0")
+)
 cep_inst_lkp = _cep_raw.select([F.col(c).alias(f"ci_{c}") for c in _cep_raw.columns])
 cep_legal_lkp= _cep_raw.select([F.col(c).alias(f"cl_{c}") for c in _cep_raw.columns])
 
@@ -754,7 +815,8 @@ sdf_enriched = (
     .withColumn("_doc_norm",
         F.regexp_replace(F.col("CPF_CNPJ"), r"\D", ""))
     .withColumn("_doc_tipo",
-        F.when(F.length("_doc_norm") == 14, F.lit("CNPJ"))
+        F.when(F.col("CPF_CNPJ").isNull() | (F.trim(F.col("CPF_CNPJ")) == ""), F.lit("NULO"))
+         .when(F.length("_doc_norm") == 14, F.lit("CNPJ"))
          .when(F.length("_doc_norm") == 11, F.lit("CPF"))
          .otherwise(F.lit("INVALIDO")))
     # CEPs normalizados (apenas dígitos, zero-padded para 8 chars)
@@ -841,66 +903,57 @@ sdf_enriched = (
 #     Lógica: CEP ausente → genérico → divergência cidade/UF
 # ---------------------------------------------------------------------------
 
+_div_cidade_inst = (
+    (F.col("_norm_cidade_inst") != "") &
+    (F.col("_norm_ci_cidade")   != "") &
+    (F.col("_norm_cidade_inst") != F.col("_norm_ci_cidade"))
+)
+_div_uf_inst = (
+    (F.col("_norm_uf_inst") != "") &
+    (F.col("_norm_ci_uf")   != "") &
+    (F.col("_norm_uf_inst") != F.col("_norm_ci_uf"))
+)
+
 sdf_enriched = sdf_enriched.withColumn(
     "_obs_end_inst",
     F.when(
         F.col("ci_cep").isNull(),
         F.concat(F.lit("[CEP] CEP não encontrado no cache: "), F.col("_cep_inst_norm"))
     ).when(
-        F.col("_cep_inst_generico"),
-        # CEP genérico: registra nota e resultado do município
+        F.col("_cep_inst_generico") & (_div_cidade_inst | _div_uf_inst),
         F.concat(
-            F.lit("[CEP] CEP genérico: "),
-            F.substring(F.col("_cep_inst_norm"), 1, 5),
-            F.lit("-"),
-            F.substring(F.col("_cep_inst_norm"), 6, 3),
-            F.lit(" (sede do município) | "),
-            F.when(
-                (F.col("_norm_cidade_inst") != "") &
-                (F.col("_norm_ci_cidade")   != "") &
-                (F.col("_norm_cidade_inst") != F.col("_norm_ci_cidade")),
-                F.concat(
-                    F.lit("Município divergente: base '"),
-                    F.col("_cidade_inst_clean"),
-                    F.lit("' x CEP '"),
-                    F.coalesce(F.col("ci_cidade"), F.lit("")),
-                    F.lit("'")
-                )
-            ).otherwise(
-                F.concat(
-                    F.lit("Município confirmado: "),
-                    F.coalesce(F.col("ci_cidade"), F.lit("")),
-                    F.lit("/"),
-                    F.coalesce(F.col("ci_uf"), F.lit(""))
-                )
-            )
+            F.lit("CEP genérico — cidade/estado divergente: base '"),
+            F.col("_cidade_inst_clean"), F.lit("/"), F.col("uf_instalacao"),
+            F.lit("' x CEP '"),
+            F.coalesce(F.col("ci_cidade"), F.lit("")), F.lit("/"),
+            F.coalesce(F.col("ci_uf"), F.lit("")), F.lit("'")
+        )
+    ).when(
+        F.col("_cep_inst_generico"),
+        F.concat(
+            F.lit("CEP genérico — município confirmado: "),
+            F.coalesce(F.col("ci_cidade"), F.lit("")), F.lit("/"),
+            F.coalesce(F.col("ci_uf"), F.lit(""))
         )
     ).otherwise(
-        # CEP encontrado e não-genérico: verifica divergência de cidade e UF
         F.concat_ws(
             " | ",
             F.when(
-                (F.col("_norm_cidade_inst") != "") &
-                (F.col("_norm_ci_cidade")   != "") &
-                (F.col("_norm_cidade_inst") != F.col("_norm_ci_cidade")),
+                _div_cidade_inst,
                 F.concat(
                     F.lit("Cidade divergente: base '"),
                     F.col("_cidade_inst_clean"),
                     F.lit("' x CEP '"),
-                    F.coalesce(F.col("ci_cidade"), F.lit("")),
-                    F.lit("'")
+                    F.coalesce(F.col("ci_cidade"), F.lit("")), F.lit("'")
                 )
             ),
             F.when(
-                (F.col("_norm_uf_inst") != "") &
-                (F.col("_norm_ci_uf")   != "") &
-                (F.col("_norm_uf_inst") != F.col("_norm_ci_uf")),
+                _div_uf_inst,
                 F.concat(
                     F.lit("UF divergente: base '"),
                     F.col("uf_instalacao"),
                     F.lit("' x CEP '"),
-                    F.coalesce(F.col("ci_uf"), F.lit("")),
-                    F.lit("'")
+                    F.coalesce(F.col("ci_uf"), F.lit("")), F.lit("'")
                 )
             ),
         )
@@ -910,6 +963,12 @@ sdf_enriched = sdf_enriched.withColumn(
 sdf_enriched = sdf_enriched.withColumn(
     "_sv_end_inst",
     F.when(
+        F.col("_cep_inst_generico") & (_div_cidade_inst | _div_uf_inst),
+        F.lit("CepGenericoDiverge")
+    ).when(
+        F.col("_cep_inst_generico"),
+        F.lit("CepGenericoOk")
+    ).when(
         F.col("_obs_end_inst").isNull() | (F.col("_obs_end_inst") == ""),
         F.lit("Confere")
     ).otherwise(F.lit("Divergente"))
@@ -921,6 +980,17 @@ sdf_enriched = sdf_enriched.withColumn(
 #     Parte Receita (somente CNPJ): compara CEP, cidade e UF com os dados da RF
 # ---------------------------------------------------------------------------
 
+_div_cidade_legal = (
+    (F.col("_norm_cidade_legal") != "") &
+    (F.col("_norm_cl_cidade")    != "") &
+    (F.col("_norm_cidade_legal") != F.col("_norm_cl_cidade"))
+)
+_div_uf_legal = (
+    (F.col("_norm_uf_legal") != "") &
+    (F.col("_norm_cl_uf")    != "") &
+    (F.col("_norm_uf_legal") != F.col("_norm_cl_uf"))
+)
+
 # Passo intermediário: obs baseada apenas no CEP legal
 sdf_enriched = sdf_enriched.withColumn(
     "_obs_cep_legal",
@@ -928,32 +998,20 @@ sdf_enriched = sdf_enriched.withColumn(
         F.col("cl_cep").isNull(),
         F.concat(F.lit("[CEP] CEP não encontrado no cache: "), F.col("_cep_legal_norm"))
     ).when(
+        F.col("_cep_legal_generico") & (_div_cidade_legal | _div_uf_legal),
+        F.concat(
+            F.lit("CEP genérico — cidade/estado divergente: base '"),
+            F.col("_cidade_legal_clean"), F.lit("/"), F.col("uf_legal"),
+            F.lit("' x CEP '"),
+            F.coalesce(F.col("cl_cidade"), F.lit("")), F.lit("/"),
+            F.coalesce(F.col("cl_uf"), F.lit("")), F.lit("'")
+        )
+    ).when(
         F.col("_cep_legal_generico"),
         F.concat(
-            F.lit("[CEP] CEP genérico: "),
-            F.substring(F.col("_cep_legal_norm"), 1, 5),
-            F.lit("-"),
-            F.substring(F.col("_cep_legal_norm"), 6, 3),
-            F.lit(" (sede do município) | "),
-            F.when(
-                (F.col("_norm_cidade_legal") != "") &
-                (F.col("_norm_cl_cidade")    != "") &
-                (F.col("_norm_cidade_legal") != F.col("_norm_cl_cidade")),
-                F.concat(
-                    F.lit("Município divergente: base '"),
-                    F.col("_cidade_legal_clean"),
-                    F.lit("' x CEP '"),
-                    F.coalesce(F.col("cl_cidade"), F.lit("")),
-                    F.lit("'")
-                )
-            ).otherwise(
-                F.concat(
-                    F.lit("Município confirmado: "),
-                    F.coalesce(F.col("cl_cidade"), F.lit("")),
-                    F.lit("/"),
-                    F.coalesce(F.col("cl_uf"), F.lit(""))
-                )
-            )
+            F.lit("CEP genérico — município confirmado: "),
+            F.coalesce(F.col("cl_cidade"), F.lit("")), F.lit("/"),
+            F.coalesce(F.col("cl_uf"), F.lit(""))
         )
     ).otherwise(
         F.concat_ws(
@@ -1057,6 +1115,13 @@ sdf_enriched = sdf_enriched.withColumn(
 sdf_enriched = sdf_enriched.withColumn(
     "_sv_end_legal",
     F.when(
+        F.col("_cep_legal_generico") & (_div_cidade_legal | _div_uf_legal),
+        F.lit("CepGenericoDiverge")
+    ).when(
+        F.col("_cep_legal_generico") &
+        (F.col("_obs_end_legal").isNull() | F.col("_obs_end_legal").contains("confirmado")),
+        F.lit("CepGenericoOk")
+    ).when(
         F.col("_obs_end_legal").isNull() | (F.col("_obs_end_legal") == ""),
         F.lit("Confere")
     ).otherwise(F.lit("Divergente"))
@@ -1135,8 +1200,9 @@ _DIMS = [
 # ------------------------------------------------------------------
 # 1) ENDERECO_INSTALACAO — todos os tipos de doc exceto INVALIDO
 # ------------------------------------------------------------------
-sdf_end_inst = sdf_enriched.filter(F.col("_doc_tipo") != "INVALIDO").select(
+sdf_end_inst = sdf_enriched.filter(~F.col("_doc_tipo").isin("INVALIDO", "NULO")).select(
     F.col("FATURA"),
+    F.col("NUMERO_FATURA"),
     F.col("ID_CLIENTE_CONTRATO").alias("ID_CONTA_CONTRATO"),
     F.lit("ENDERECO_INSTALACAO").alias("REGRA"),
     F.col("SEGMENTO"),
@@ -1177,6 +1243,7 @@ sdf_end_inst = sdf_enriched.filter(F.col("_doc_tipo") != "INVALIDO").select(
 # ------------------------------------------------------------------
 sdf_end_legal = sdf_enriched.filter(F.col("_doc_tipo") == "CNPJ").select(
     F.col("FATURA"),
+    F.col("NUMERO_FATURA"),
     F.col("ID_CLIENTE_CONTRATO").alias("ID_CONTA_CONTRATO"),
     F.lit("ENDERECO_LEGAL").alias("REGRA"),
     F.col("SEGMENTO"),
@@ -1215,13 +1282,16 @@ sdf_end_legal = sdf_enriched.filter(F.col("_doc_tipo") == "CNPJ").select(
 # ------------------------------------------------------------------
 # 3) DADOS_CADASTRAIS — somente CNPJ (linha resumida na tabela de endereços)
 # ------------------------------------------------------------------
-sdf_dados_cad_val = sdf_enriched.filter(F.col("_doc_tipo") == "CNPJ").select(
+_nulo_obs = F.lit("CPF/CNPJ não encontrado")
+
+sdf_dados_cad_val = sdf_enriched.filter(F.col("_doc_tipo").isin("CNPJ", "NULO")).select(
     F.col("FATURA"),
+    F.col("NUMERO_FATURA"),
     F.col("ID_CLIENTE_CONTRATO").alias("ID_CONTA_CONTRATO"),
     F.lit("DADOS_CADASTRAIS").alias("REGRA"),
     F.col("SEGMENTO"),
     F.col("_doc_norm").alias("Documento"),
-    F.lit("CNPJ").alias("Tipo"),
+    F.col("_doc_tipo").alias("Tipo"),
     # Sem CEP
     _null.alias("CEP_Instalacao"),
     _null.alias("CEP_Legal"),
@@ -1237,17 +1307,38 @@ sdf_dados_cad_val = sdf_enriched.filter(F.col("_doc_tipo") == "CNPJ").select(
     _null.alias("UF_Receita"),
     F.col("r_razao_social").alias("Razao_Social"),
     F.col("r_situacao_cadastral").alias("Situacao_Cadastral"),
-    # Validação
-    F.col("_sv_cad").alias("Status_Validacao"),
-    F.col("_obs_cad").alias("Observacao"),
+    # Validação — NULO → INCORRETO; CNPJ → lógica normal
+    F.when(F.col("_doc_tipo") == "NULO", F.lit("INCORRETO"))
+     .otherwise(F.col("_sv_cad")).alias("Status_Validacao"),
+    F.when(F.col("_doc_tipo") == "NULO", _nulo_obs)
+     .otherwise(F.col("_obs_cad")).alias("Observacao"),
     *_DIMS,
 )
 
 # ------------------------------------------------------------------
 # 4) INVALIDOS
 # ------------------------------------------------------------------
+_inv_tipo_doc = F.when(
+    F.col("CPF_CNPJ").isNull() | (F.trim(F.col("CPF_CNPJ")) == ""), F.lit("NULO")
+).when(
+    F.length(F.regexp_replace(F.col("CPF_CNPJ"), r"\D", "")) == 11, F.lit("CPF")
+).when(
+    F.length(F.regexp_replace(F.col("CPF_CNPJ"), r"\D", "")) == 14, F.lit("CNPJ")
+).otherwise(F.lit("DOC"))
+
+_inv_obs = F.when(
+    F.col("CPF_CNPJ").isNull() | (F.trim(F.col("CPF_CNPJ")) == ""),
+    F.lit("Nulo"),
+).otherwise(F.concat(
+    _inv_tipo_doc,
+    F.lit("("),
+    F.col("CPF_CNPJ"),
+    F.lit(") - Inválido"),
+))
+
 sdf_invalidos = sdf_enriched.filter(F.col("_doc_tipo") == "INVALIDO").select(
     F.col("FATURA"),
+    F.col("NUMERO_FATURA"),
     F.col("ID_CLIENTE_CONTRATO").alias("ID_CONTA_CONTRATO"),
     F.lit("INVALIDO").alias("REGRA"),
     F.col("SEGMENTO"),
@@ -1267,8 +1358,8 @@ sdf_invalidos = sdf_enriched.filter(F.col("_doc_tipo") == "INVALIDO").select(
     _null.alias("UF_Receita"),
     _null.alias("Razao_Social"),
     _null.alias("Situacao_Cadastral"),
-    F.lit("Documento inválido").alias("Status_Validacao"),
-    _null.alias("Observacao"),
+    F.lit("INCORRETO").alias("Status_Validacao"),
+    _inv_obs.alias("Observacao"),
     *_DIMS,
 )
 
@@ -1297,8 +1388,9 @@ for r in _counts_end:
 
 # COMMAND ----------
 
-validacao_dados_cadastrais = sdf_enriched.filter(F.col("_doc_tipo") == "CNPJ").select(
+validacao_dados_cadastrais = sdf_enriched.filter(F.col("_doc_tipo").isin("CNPJ", "NULO")).select(
     F.col("FATURA"),
+    F.col("NUMERO_FATURA"),
     F.col("ID_CLIENTE_CONTRATO").alias("ID_CONTA_CONTRATO"),
     F.lit("DADOS_CADASTRAIS").alias("REGRA"),
     F.col("_doc_norm").alias("CNPJ"),
@@ -1351,13 +1443,17 @@ print(f"  validacao_dados_cadastrais: {_n_cad} linhas (CNPJs)")
 def _status_cols(sv_col: str):
     """Retorna (status_expr, substatus_expr) baseado na coluna de sv."""
     status = (
-        F.when(F.col(sv_col) == "Confere",        F.lit("CORRETO"))
-         .when(F.col(sv_col) == "nao_carregado",  F.lit("PENDENTE"))
+        F.when(F.col(sv_col) == "Confere",            F.lit("CORRETO"))
+         .when(F.col(sv_col) == "CepGenericoOk",      F.lit("CORRETO"))
+         .when(F.col(sv_col) == "nao_carregado",      F.lit("PENDENTE"))
+         .when(F.col(sv_col) == "CepGenericoDiverge", F.lit("INCORRETO"))
          .otherwise(F.lit("INCORRETO"))
     )
     substatus = (
-        F.when(F.col(sv_col) == "Confere",        F.lit("OK"))
-         .when(F.col(sv_col) == "nao_carregado",  F.lit("CACHE_VAZIO"))
+        F.when(F.col(sv_col) == "Confere",            F.lit("OK"))
+         .when(F.col(sv_col) == "CepGenericoOk",      F.lit("ALERTA"))
+         .when(F.col(sv_col) == "nao_carregado",      F.lit("CACHE_VAZIO"))
+         .when(F.col(sv_col) == "CepGenericoDiverge", F.lit("ERRO"))
          .otherwise(F.lit("ERRO"))
     )
     return status, substatus
@@ -1428,8 +1524,9 @@ _STATUS_DIMS = [
 ]
 
 # ENDERECO_INSTALACAO
-_sf_inst = sdf_enriched.filter(F.col("_doc_tipo") != "INVALIDO").select(
+_sf_inst = sdf_enriched.filter(~F.col("_doc_tipo").isin("INVALIDO", "NULO")).select(
     F.col("FATURA"),
+    F.col("NUMERO_FATURA"),
     F.col("ID_CLIENTE_CONTRATO").alias("ID_CONTA_CONTRATO"),
     F.lit("ENDERECO_INSTALACAO").alias("REGRA"),
     F.col("SEGMENTO"),
@@ -1445,6 +1542,7 @@ _sf_inst = sdf_enriched.filter(F.col("_doc_tipo") != "INVALIDO").select(
 # ENDERECO_LEGAL (CNPJ only)
 _sf_legal = sdf_enriched.filter(F.col("_doc_tipo") == "CNPJ").select(
     F.col("FATURA"),
+    F.col("NUMERO_FATURA"),
     F.col("ID_CLIENTE_CONTRATO").alias("ID_CONTA_CONTRATO"),
     F.lit("ENDERECO_LEGAL").alias("REGRA"),
     F.col("SEGMENTO"),
@@ -1458,14 +1556,15 @@ _sf_legal = sdf_enriched.filter(F.col("_doc_tipo") == "CNPJ").select(
 )
 
 # DADOS_CADASTRAIS (CNPJ only)
-_sf_cad = sdf_enriched.filter(F.col("_doc_tipo") == "CNPJ").select(
+_sf_cad = sdf_enriched.filter(F.col("_doc_tipo").isin("CNPJ", "NULO")).select(
     F.col("FATURA"),
+    F.col("NUMERO_FATURA"),
     F.col("ID_CLIENTE_CONTRATO").alias("ID_CONTA_CONTRATO"),
     F.lit("DADOS_CADASTRAIS").alias("REGRA"),
     F.col("SEGMENTO"),
-    _st_cad.alias("STATUS"),
-    _ss_cad.alias("SUBSTATUS"),
-    F.col("_obs_cad").alias("OBSERVACAO"),
+    F.when(F.col("_doc_tipo") == "NULO", F.lit("INCORRETO")).otherwise(_st_cad).alias("STATUS"),
+    F.when(F.col("_doc_tipo") == "NULO", F.lit("ERRO")).otherwise(_ss_cad).alias("SUBSTATUS"),
+    F.when(F.col("_doc_tipo") == "NULO", _nulo_obs).otherwise(F.col("_obs_cad")).alias("OBSERVACAO"),
     _billing_cad.alias("DADOS_BILLING"),
     F.when(
         F.col("r_cnpj").isNotNull(),
@@ -1485,13 +1584,14 @@ _sf_cad = sdf_enriched.filter(F.col("_doc_tipo") == "CNPJ").select(
 # INVALIDOS
 _sf_inv = sdf_enriched.filter(F.col("_doc_tipo") == "INVALIDO").select(
     F.col("FATURA"),
+    F.col("NUMERO_FATURA"),
     F.col("ID_CLIENTE_CONTRATO").alias("ID_CONTA_CONTRATO"),
     F.lit("INVALIDO").alias("REGRA"),
     F.col("SEGMENTO"),
     F.lit("INCORRETO").alias("STATUS"),
     F.lit("ERRO").alias("SUBSTATUS"),
-    F.lit("[DOC] Documento inválido").alias("OBSERVACAO"),
-    F.concat(F.lit("DOC: "), F.coalesce(F.col("CPF_CNPJ"), F.lit(""))).alias("DADOS_BILLING"),
+    _inv_obs.alias("OBSERVACAO"),
+    _inv_obs.alias("DADOS_BILLING"),
     _null.alias("DADOS_CONTRATO"),
     _null.alias("DADOS_TABELA_VERDADE"),
     *_STATUS_DIMS,
@@ -1525,6 +1625,7 @@ for _tbl, _col in [
     except Exception:
         pass
 
+
 def _sem_strings_vazias(df):
     """Converte '' para NULL em colunas STRING — evita CAST_INVALID_INPUT em ANSI mode."""
     from pyspark.sql.types import StringType
@@ -1535,6 +1636,23 @@ def _sem_strings_vazias(df):
         else F.col(c).alias(c)
         for c in df.columns
     ])
+
+# Limpa dados anteriores preservando schema
+for _tbl in ["validacao_enderecos", "validacao_dados_cadastrais"]:
+    try:
+        spark.sql(f"TRUNCATE TABLE {CATALOG}.{_tbl}")
+        print(f"[TRUNCATE] {_tbl} limpa.")
+    except Exception:
+        pass  # tabela não existe ainda — será criada no write
+
+try:
+    spark.sql(f"""
+        DELETE FROM {CATALOG}.validacao_status_fatura
+        WHERE REGRA IN ('DADOS_CADASTRAIS', 'ENDERECO_INSTALACAO', 'ENDERECO_LEGAL', 'INVALIDO')
+    """)
+    print("[DELETE] validacao_status_fatura: registros do lote removidos.")
+except Exception:
+    pass  # tabela não existe ainda — será criada no write
 
 # Grava as 3 tabelas de output
 (

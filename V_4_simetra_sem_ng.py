@@ -322,7 +322,15 @@ spark.sql("DROP TABLE IF EXISTS accenture.validacao_hipoteses")
     .option("overwriteSchema", "true")
     .saveAsTable("accenture.validacao_hipoteses")
 )
-print(f"Tabela accenture.validacao_hipoteses gravada: {df_validacao.count():,} CNPJs")
+
+# em serverless, optimizeWrite é controlado via table property (não spark config)
+spark.sql("""
+    ALTER TABLE accenture.validacao_hipoteses
+    SET TBLPROPERTIES ('delta.autoOptimize.optimizeWrite' = 'true')
+""")
+
+qtd_gravada = spark.table("accenture.validacao_hipoteses").count()
+print(f"Tabela accenture.validacao_hipoteses gravada: {qtd_gravada:,} CNPJs")
 
 # COMMAND ----------
 

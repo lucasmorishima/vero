@@ -20,9 +20,13 @@
 
 # COMMAND ----------
 
-from datetime import datetime as _dt
+from datetime import datetime
+
+# Ciclo automatico: ano-mes atual
+_CICLO_AUTO = datetime.now().strftime("%Y-%m")
+
 dbutils.widgets.removeAll()
-dbutils.widgets.text("ciclo_ref", _dt.now().strftime("%Y-%m"), "Ciclo (AAAA-MM)")
+dbutils.widgets.text("ciclo_ref", _CICLO_AUTO, "Ciclo (AAAA-MM)")
 CICLO_REF = dbutils.widgets.get("ciclo_ref")
 
 TBL_FONTE   = "accenture.validacao_status_fatura"
@@ -49,8 +53,8 @@ from pyspark.sql.types import StringType, DoubleType, IntegerType, TimestampType
 
 spark.sql(f"""
 CREATE TABLE IF NOT EXISTS {TBL_DESTINO} (
-    FATURA                  DOUBLE,
-    ID_CONTA                DOUBLE,
+    FATURA                  STRING,
+    ID_CONTA                STRING,
     STATUS                  STRING,
     STATUS_VALIDACAO        STRING,
     ANALISTA                STRING,
@@ -116,69 +120,84 @@ print(f"Fonte: {cnt_fonte:,} linhas no ciclo {CICLO_REF}")
 # COMMAND ----------
 
 # ---------------------------------------------------------------------------
-# 5a. Coletar PROBLEMAS e RESUMOS das linhas INCORRETAS por fatura/conta
+# 5a. Preparar colunas auxiliares antes do groupBy
 # ---------------------------------------------------------------------------
 
-df_problemas = (
-    df_fonte
-    .filter(F.col("STATUS") == "INCORRETO")
-    .groupBy("FATURA", "ID_CONTA_CONTRATO")
-    .agg(
-        # PROBLEMA: concatena REGRA distintas das linhas incorretas
-        F.concat_ws(
-            " | ",
-            F.collect_set(F.col("REGRA"))
-        ).alias("_PROBLEMA"),
+# Regras que usam Produto como TAG (em vez de REGRA)
+_REGRAS_TAG_PRODUTO = ["VALOR_OFERTA", "DIVERGENCIA_CONTRATO_PRODUTO", "VALOR ZERADO", "VALOR FATURA"]
 
-        # RESUMO: concatena TAG: observacao | SEVERIDADE: substatus
-        F.concat_ws(
-            " | ",
-            F.collect_list(
-                F.concat(
-                    F.coalesce(F.col("OBSERVACAO"), F.lit("")),
-                )
-            )
-        ).alias("_RESUMO"),
+df_prep = (
+    df_fonte
+    # TAG: se REGRA in lista especial → Produto, senao → REGRA
+    .withColumn("_tag",
+        F.when(
+            F.col("REGRA").isin(_REGRAS_TAG_PRODUTO),
+            F.coalesce(F.col("Produto"), F.col("REGRA"))
+        ).otherwise(F.col("REGRA"))
+    )
+    # Coluna com REGRA somente quando INCORRETO (para concatenar no PROBLEMA)
+    .withColumn("_regra_inc",
+        F.when(F.col("STATUS") == "INCORRETO", F.col("REGRA"))
+    )
+    # Coluna com TAG: OBSERVACAO somente quando INCORRETO
+    .withColumn("_obs_inc",
+        F.when(
+            (F.col("STATUS") == "INCORRETO") & F.col("OBSERVACAO").isNotNull() & (F.trim(F.col("OBSERVACAO")) != ""),
+            F.concat(F.col("_tag"), F.lit(": "), F.col("OBSERVACAO"))
+        ).when(
+            F.col("STATUS") == "INCORRETO",
+            F.col("_tag")
+        )
     )
 )
 
 # ---------------------------------------------------------------------------
-# 5b. Agregar toda a fonte por FATURA + ID_CONTA_CONTRATO
+# 5b. Agregar TUDO em um unico groupBy (sem JOIN — evita problema NaN)
 # ---------------------------------------------------------------------------
 
 df_agg = (
-    df_fonte
+    df_prep
     .groupBy("FATURA", "ID_CONTA_CONTRATO")
     .agg(
-        # Pior status do grupo
+        # Flag: tem ao menos 1 INCORRETO?
         F.max(
             F.when(F.col("STATUS") == "INCORRETO", F.lit(1)).otherwise(F.lit(0))
         ).alias("_tem_incorreto"),
 
-        # Soma de VALOR_BILLING (0 se nulo)
+        # PROBLEMA: regras distintas das linhas INCORRETAS
+        F.concat_ws(" | ", F.collect_set(F.col("_regra_inc"))).alias("_PROBLEMA"),
+
+        # OBSERVACAO: todas as obs das linhas INCORRETAS
+        F.concat_ws(" | ", F.collect_list(F.col("_obs_inc"))).alias("_OBSERVACAO"),
+
+        # RESUMO: idem OBSERVACAO
+        F.concat_ws(" | ", F.collect_list(F.col("_obs_inc"))).alias("_RESUMO"),
+
+        # Soma de VALOR_BILLING (0 se nulo ou vazio)
         F.sum(
-            F.coalesce(F.col("VALOR_BILLING").cast(DoubleType()), F.lit(0.0))
+            F.coalesce(
+                F.when(
+                    F.col("VALOR_BILLING").isNotNull() & (F.trim(F.col("VALOR_BILLING").cast(StringType())) != ""),
+                    F.col("VALOR_BILLING").cast(DoubleType())
+                ),
+                F.lit(0.0)
+            )
         ).alias("_valor_soma"),
     )
 )
 
 # ---------------------------------------------------------------------------
-# 5c. JOIN e montar as 16 colunas exatas
+# 5c. Montar as 16 colunas exatas
 # ---------------------------------------------------------------------------
 
 df_result = (
     df_agg
-    .join(df_problemas, on=["FATURA", "ID_CONTA_CONTRATO"], how="left")
     .select(
-        # 1. FATURA (DOUBLE)
-        F.col("FATURA").cast(DoubleType()).alias("FATURA"),
+        # 1. FATURA (STRING)
+        F.col("FATURA").cast(StringType()).alias("FATURA"),
 
-        # 2. ID_CONTA (DOUBLE) — extrai digitos, nullif vazio, try_cast
-        F.when(
-            F.regexp_replace(F.col("ID_CONTA_CONTRATO"), r"[^0-9]", "") != "",
-            F.regexp_replace(F.col("ID_CONTA_CONTRATO"), r"[^0-9]", "").cast(DoubleType())
-        ).otherwise(F.lit(None).cast(DoubleType()))
-         .alias("ID_CONTA"),
+        # 2. ID_CONTA (STRING)
+        F.col("ID_CONTA_CONTRATO").cast(StringType()).alias("ID_CONTA"),
 
         # 3. STATUS
         F.when(F.col("_tem_incorreto") == 1, F.lit("INCORRETO"))
@@ -193,13 +212,17 @@ df_result = (
         # 5. ANALISTA — nulo
         F.lit(None).cast(StringType()).alias("ANALISTA"),
 
-        # 6. OBSERVACAO — nulo (preenchimento manual posterior)
-        F.lit(None).cast(StringType()).alias("OBSERVACAO"),
-
-        # 7. PROBLEMA — concatenacao das REGRAS incorretas
+        # 6. OBSERVACAO — concatena obs das linhas INCORRETAS
         F.when(
-            F.col("_tem_incorreto") == 1,
-            F.coalesce(F.col("_PROBLEMA"), F.lit(""))
+            (F.col("_tem_incorreto") == 1) & (F.col("_OBSERVACAO") != ""),
+            F.col("_OBSERVACAO")
+        ).otherwise(F.lit(None).cast(StringType()))
+         .alias("OBSERVACAO"),
+
+        # 7. PROBLEMA — concatena REGRA das linhas INCORRETAS
+        F.when(
+            (F.col("_tem_incorreto") == 1) & (F.col("_PROBLEMA") != ""),
+            F.col("_PROBLEMA")
         ).otherwise(F.lit(None).cast(StringType()))
          .alias("PROBLEMA"),
 
@@ -218,10 +241,10 @@ df_result = (
         # 11. CHAMADO — nulo
         F.lit(None).cast(StringType()).alias("CHAMADO"),
 
-        # 12. RESUMO — concatenacao das observacoes
+        # 12. RESUMO — concatena obs com regra
         F.when(
-            F.col("_tem_incorreto") == 1,
-            F.coalesce(F.col("_RESUMO"), F.lit(""))
+            (F.col("_tem_incorreto") == 1) & (F.col("_RESUMO") != ""),
+            F.col("_RESUMO")
         ).otherwise(F.lit(None).cast(StringType()))
          .alias("RESUMO"),
 
@@ -246,10 +269,14 @@ df_result = (
     )
 )
 
+# Remove duplicatas por FATURA + ID_CONTA
+df_result = df_result.dropDuplicates(["FATURA", "ID_CONTA"])
+
+# Somente faturas com STATUS INCORRETO
+df_result = df_result.filter(F.col("STATUS") == "INCORRETO")
+
 cnt = df_result.count()
-cnt_i = df_result.filter(F.col("STATUS") == "INCORRETO").count()
-cnt_c = df_result.filter(F.col("STATUS") == "CORRETO").count()
-print(f"Resultado: {cnt:,} faturas | INCORRETO={cnt_i:,} | CORRETO={cnt_c:,}")
+print(f"Resultado: {cnt:,} faturas INCORRETAS (unicas por FATURA+ID_CONTA)")
 
 # COMMAND ----------
 
@@ -258,17 +285,17 @@ print(f"Resultado: {cnt:,} faturas | INCORRETO={cnt_i:,} | CORRETO={cnt_c:,}")
 
 # COMMAND ----------
 
-# Limpa registros do ciclo atual (idempotente)
+# Limpa ciclo atual (idempotente)
 try:
-    spark.sql(f"DELETE FROM {TBL_DESTINO} WHERE CRIADO_EM >= '{CICLO_REF}-01'")
+    spark.sql(f"DELETE FROM {TBL_DESTINO}")
 except:
     pass  # Tabela vazia na primeira execucao
 
-# Append
+# Append somente INCORRETOS unicos
 df_result.write.format("delta").mode("append").saveAsTable(TBL_DESTINO)
 
 cnt_final = spark.table(TBL_DESTINO).count()
-print(f"Gravado: {cnt_final:,} registros em {TBL_DESTINO}")
+print(f"Gravado: {cnt_final:,} registros em {TBL_DESTINO} (somente INCORRETO)")
 
 # COMMAND ----------
 

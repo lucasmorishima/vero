@@ -312,24 +312,17 @@ display(df_validacao)
 # --------------------------------------------------------------------------
 # Grava tabela para análise — accenture.validacao_hipoteses
 # --------------------------------------------------------------------------
+df_validacao.createOrReplaceTempView("vw_validacao_export")
+
 spark.sql("DROP TABLE IF EXISTS accenture.validacao_hipoteses")
-
-(
-    df_validacao
-    .write
-    .format("delta")
-    .mode("overwrite")
-    .option("overwriteSchema", "true")
-    .saveAsTable("accenture.validacao_hipoteses")
-)
-
-# em serverless, optimizeWrite é controlado via table property (não spark config)
 spark.sql("""
-    ALTER TABLE accenture.validacao_hipoteses
-    SET TBLPROPERTIES ('delta.autoOptimize.optimizeWrite' = 'true')
+    CREATE TABLE accenture.validacao_hipoteses
+    USING DELTA
+    TBLPROPERTIES ('delta.autoOptimize.optimizeWrite' = 'true')
+    AS SELECT * FROM vw_validacao_export
 """)
 
-qtd_gravada = spark.table("accenture.validacao_hipoteses").count()
+qtd_gravada = spark.sql("SELECT COUNT(*) AS n FROM accenture.validacao_hipoteses").collect()[0]["n"]
 print(f"Tabela accenture.validacao_hipoteses gravada: {qtd_gravada:,} CNPJs")
 
 # COMMAND ----------

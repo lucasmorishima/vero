@@ -97,22 +97,20 @@ df_fonte = (
 )
 cnt_total = df_fonte.count()
 
-# Filtro 1: somente faturas que existem na principal (INCORRETAS)
+# Filtro 1: somente contas que existem na principal (INCORRETAS)
 TBL_PRINCIPAL = "accenture.faturas_principal_vero"
 df_principal = spark.table(TBL_PRINCIPAL).select(
-    F.col("FATURA").alias("_p_fat"),
     F.col("ID_CONTA").alias("_p_cta")
-)
+).dropDuplicates(["_p_cta"])
 
 df_fonte = (
     df_fonte
     .join(
         df_principal,
-        (df_fonte["FATURA"].cast(StringType()) == df_principal["_p_fat"]) &
-        (df_fonte["ID_CONTA_CONTRATO"].cast(StringType()) == df_principal["_p_cta"]),
+        df_fonte["ID_CONTA_CONTRATO"].cast(StringType()) == df_principal["_p_cta"],
         how="inner"
     )
-    .drop("_p_fat", "_p_cta")
+    .drop("_p_cta")
 )
 
 # Filtro 2: somente INCORRETO com OBSERVACAO (que gera TAG)
@@ -203,15 +201,22 @@ df_result = (
         ).alias("DADOS_KENAN"),
 
         # 9. DADOS_TABELA_VERDADE — condicional por REGRA (com fallback)
-        F.coalesce(
-            F.when(F.col("REGRA") == "BATIMENTO_PRODUTOS_FATURA",
-                   F.col("VALOR_TABELA_VERDADE").cast(StringType()))
-             .when(F.col("REGRA").isin("VALOR FATURA", "VALOR ZERADO"),
-                   F.col("VALOR_CONTRATO").cast(StringType()))
-             .otherwise(F.col("DADOS_TABELA_VERDADE").cast(StringType())),
-            F.col("DADOS_TABELA_VERDADE").cast(StringType()),
-            F.col("VALOR_TABELA_VERDADE").cast(StringType()),
-            F.col("VALOR_CONTRATO").cast(StringType())
+        #    DIVERGENCIA_CONTRATO_PRODUTO / VALOR FATURA / VALOR ZERADO → logica especifica
+        #    Demais → DADOS_CONTRATO se preenchido, senao DADOS_TABELA_VERDADE
+        F.when(
+            F.col("REGRA").isin("DIVERGENCIA_CONTRATO_PRODUTO", "VALOR FATURA", "VALOR ZERADO"),
+            F.coalesce(
+                F.col("VALOR_CONTRATO").cast(StringType()),
+                F.col("DADOS_TABELA_VERDADE").cast(StringType())
+            )
+        ).otherwise(
+            F.coalesce(
+                F.when(
+                    F.col("DADOS_CONTRATO").isNotNull() & (F.trim(F.col("DADOS_CONTRATO").cast(StringType())) != ""),
+                    F.col("DADOS_CONTRATO").cast(StringType())
+                ),
+                F.col("DADOS_TABELA_VERDADE").cast(StringType())
+            )
         ).alias("DADOS_TABELA_VERDADE"),
 
         # 10. ID_LOTE

@@ -1,34 +1,49 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # BILLING ASSURANCE — Carga faturas_principal_vero
-# MAGIC **Fonte:** `accenture.validacao_status_fatura` (coracao do processo)
-# MAGIC **Destino:** `accenture.faturas_principal_vero` (espelho identico a faturas_principal_v4)
+# MAGIC # BILLING ASSURANCE — Carga: accenture.tab_clientes_nfcom
+# MAGIC **Vero Internet | Accenture**
 # MAGIC
-# MAGIC ### Logica
-# MAGIC - Aglutina por FATURA + ID_CONTA
-# MAGIC - Linhas INCORRETAS: concatena no campo PROBLEMA
-# MAGIC - Se qualquer linha INCORRETA → STATUS=INCORRETO, STATUS_VALIDACAO=PENDENTE
-# MAGIC - ANALISTA e OBSERVACAO → nulo (preenchimento manual)
-# MAGIC - VALOR → 0 se nulo
-# MAGIC - Campos incrementais preenchidos automaticamente
-# MAGIC - Campos nao listados → nulo
+# MAGIC Consolida os dados de faturamento das 3 fontes (NG, ADAPTER, SIMETRA) em uma
+# MAGIC tabela unificada com os campos necessários para validação da NFCom modelo 62.
+# MAGIC
+# MAGIC ### Fontes
+# MAGIC | Sistema  | Tabela origem                                          | Chave contrato  |
+# MAGIC |----------|--------------------------------------------------------|-----------------|
+# MAGIC | NG       | negocio.base_faturamento_ng_julho2026                  | CONTA_NUMERO    |
+# MAGIC | ADAPTER  | negocio.base_fechamento_faturamento_adapter_junho      | idcontrato      |
+# MAGIC | SIMETRA  | negocio.base_faturamento_simetra (quando disponível)   | COD_CNTR        |
+# MAGIC
+# MAGIC ### Idempotência
+# MAGIC DELETE por `sistema_origem + ciclo_faturamento` antes do INSERT.
+# MAGIC Reprocessamento seguro para qualquer ciclo.
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 1. Parametros
+# MAGIC ## 1. Parâmetros
 
 # COMMAND ----------
 
-from datetime import datetime as _dt
 dbutils.widgets.removeAll()
-dbutils.widgets.text("ciclo_ref", _dt.now().strftime("%Y-%m"), "Ciclo (AAAA-MM)")
-CICLO_REF = dbutils.widgets.get("ciclo_ref")
+dbutils.widgets.text("ciclo_ng",      "202607", "Ciclo NG (AAAAMM)")
+dbutils.widgets.text("ciclo_adapter", "202607", "Ciclo ADAPTER (AAAAMM)")
+dbutils.widgets.text("ciclo_simetra", "202607", "Ciclo SIMETRA (AAAAMM)")
 
-TBL_FONTE   = "accenture.validacao_status_fatura"
-TBL_DESTINO = "accenture.faturas_principal_vero"
+CICLO_NG      = dbutils.widgets.get("ciclo_ng")
+CICLO_ADAPTER = dbutils.widgets.get("ciclo_adapter")
+CICLO_SIMETRA = dbutils.widgets.get("ciclo_simetra")
 
-print(f"Fonte: {TBL_FONTE} → Destino: {TBL_DESTINO} | Ciclo: {CICLO_REF}")
+SCHEMA        = "accenture"
+TBL_DEST      = f"{SCHEMA}.tab_clientes_nfcom"
+
+TBL_NG        = "negocio.base_faturamento_ng_julho2026"
+TBL_ADAPTER   = "negocio.base_fechamento_faturamento_adapter_junho"
+TBL_SIMETRA   = "negocio.base_faturamento_simetra"   # quando disponível
+
+print(f"Ciclo NG      : {CICLO_NG}")
+print(f"Ciclo ADAPTER : {CICLO_ADAPTER}")
+print(f"Ciclo SIMETRA : {CICLO_SIMETRA}")
+print(f"Destino       : {TBL_DEST}")
 
 # COMMAND ----------
 
@@ -38,337 +53,524 @@ print(f"Fonte: {TBL_FONTE} → Destino: {TBL_DESTINO} | Ciclo: {CICLO_REF}")
 # COMMAND ----------
 
 from pyspark.sql import functions as F
-from pyspark.sql.types import StringType, DoubleType, IntegerType, TimestampType, DateType
+from pyspark.sql.types import StringType
+
+spark.conf.set("spark.sql.shuffle.partitions", "200")
+
+print("✅ Setup concluído")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 3. DDL — schema identico a faturas_principal_v4
+# MAGIC ## 3. DDL — Tabela destino (idempotente)
+# MAGIC
+# MAGIC Campos selecionados com base nos requisitos de validação NFCom:
+# MAGIC - Identificação do contrato, fatura e item
+# MAGIC - Tributação real: ICMS, PIS, COFINS, FUST, FUNTTEL
+# MAGIC - Classificação fiscal: CCLASS, CFOP, CST
+# MAGIC - Dados geográficos: UF, cidade (para validação de CFOP intra/interestadual)
+# MAGIC - Controle: sistema_origem, ciclo_faturamento, status NFCom
 
 # COMMAND ----------
 
 spark.sql(f"""
-CREATE TABLE IF NOT EXISTS {TBL_DESTINO} (
-    FATURA                  DOUBLE,
-    ID_CONTA                DOUBLE,
-    STATUS                  STRING,
-    STATUS_VALIDACAO        STRING,
-    ANALISTA                STRING,
-    OBSERVACAO              STRING,
-    PROBLEMA                STRING,
-    VALOR                   DOUBLE,
-    CRIADO_EM               STRING,
-    STATUS_RETORNO          STRING,
-    CHAMADO                 STRING,
-    RESUMO                  STRING,
-    Ordem_Status            INT,
-    DATA_ABERTURA_CHAMADO   DATE,
-    DT_EMISSAO              DATE,
-    Valor_Positive          STRING
+CREATE TABLE IF NOT EXISTS {TBL_DEST} (
+
+    -- Controle
+    id_registro         STRING      COMMENT 'PK — MD5(sistema + contrato + fatura + item + ciclo)',
+    sistema_origem      STRING      COMMENT 'NG | ADAPTER | SIMETRA',
+    ciclo_faturamento   STRING      COMMENT 'AAAAMM',
+    dt_carga            TIMESTAMP,
+
+    -- Identificação do contrato e cliente
+    id_conta_contrato   STRING      COMMENT 'CONTA_NUMERO (NG) | idcontrato (ADAPTER) | COD_CNTR (SIMETRA)',
+    id_cliente          STRING      COMMENT 'COD_CLIENTE_SAP (NG/ADAPTER) | id_cliente (SIMETRA)',
+    nome_assinante      STRING,
+    tipo_pessoa         STRING      COMMENT 'PF | PJ — TipoPessoa (ADAPTER) | TIPO_ASSINANTE (NG)',
+    empresa_prestadora  STRING,
+
+    -- Identificação da fatura e item
+    fatura_numero       STRING,
+    fatura_data_emissao STRING,
+    fatura_valor_atual  DOUBLE,
+    nf_numero           STRING,
+    nf_valor            DOUBLE,
+    nf_item_cod_sap     STRING,
+    nf_item_descricao   STRING,
+    posicao_item        STRING,
+    data_inicio_cobranca STRING,
+    data_fim_cobranca   STRING,
+    nf_item_valor       DOUBLE,
+
+    -- Classificação fiscal (chave do motor NFCom)
+    cclass              STRING      COMMENT 'Codigo CCLASS — chave principal do motor tributario',
+    cfop                STRING      COMMENT 'CFOP do item (nulo para ISS/SVA/financeiro)',
+    cst_icms            STRING      COMMENT 'CST ICMS do item (nulo para indSemCST)',
+
+    -- Tributação real (standing)
+    icms_aliquota       DOUBLE,
+    icms_base_calculo   DOUBLE,
+    icms_valor          DOUBLE,
+    iss_aliquota        DOUBLE,
+    iss_base_calculo    DOUBLE,
+    iss_valor           DOUBLE,
+    pis_aliquota        DOUBLE,
+    pis_base_calculo    DOUBLE,
+    pis_valor           DOUBLE,
+    cofins_aliquota     DOUBLE,
+    cofins_base_calculo DOUBLE,
+    cofins_valor        DOUBLE,
+    fust_aliquota       DOUBLE,
+    fust_base_calculo   DOUBLE,
+    fust_valor          DOUBLE,
+    funttel_aliquota    DOUBLE,
+    funttel_base_calculo DOUBLE,
+    funttel_valor       DOUBLE,
+
+    -- Dados geográficos (validação CFOP + ICMS)
+    nf_uf               STRING      COMMENT 'UF do destinatário — para validação CFOP intra/interestadual',
+    nf_cidade           STRING,
+
+    -- Status NFCom
+    status_nfcom        STRING,
+    tipo_emissao_nfcom  STRING,
+    cancelada           STRING,
+    nota_substituta     STRING,
+    nota_substituida    STRING,
+    chave_acesso_nfcom  STRING,
+
+    -- Regime especial
+    regime_especial     STRING,
+
+    -- Hash CDC
+    hash_registro       STRING
 )
 USING DELTA
+PARTITIONED BY (ciclo_faturamento, sistema_origem)
 TBLPROPERTIES (
     'delta.autoOptimize.optimizeWrite' = 'true',
-    'delta.autoOptimize.autoCompact'   = 'true'
+    'delta.autoOptimize.autoCompact'   = 'true',
+    'delta.enableChangeDataFeed'       = 'true'
 )
 """)
-print(f"DDL {TBL_DESTINO} OK — 16 colunas identicas a faturas_principal_v4")
+
+print(f"✅ Tabela {TBL_DEST} pronta")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 4. Leitura da fonte
+# MAGIC ## 4. Função auxiliar de normalização
 
 # COMMAND ----------
 
-df_fonte = (
-    spark.table(TBL_FONTE)
-    .filter(F.col("ID_Lote") == CICLO_REF)
-)
-cnt_fonte = df_fonte.count()
-print(f"Fonte: {cnt_fonte:,} linhas no ciclo {CICLO_REF}")
+def norm_str(col):
+    """Normaliza string: trim + upper + nulos padronizados."""
+    return F.when(
+        F.upper(F.trim(col.cast(StringType()))).isin("", "NULL", "NAN", "NONE", "-"),
+        F.lit(None).cast(StringType())
+    ).otherwise(F.trim(col.cast(StringType())))
+
+_NULL_STRS = ("", "null", "nan", "None", "NaN", "NULL", "none")
+
+def norm_dbl(col):
+    """Converte para double; strings nulas literais viram NULL antes do cast."""
+    s = F.trim(col.cast(StringType()))
+    return F.when(s.isNull() | s.isin(*_NULL_STRS), F.lit(None).cast("double")).otherwise(s.cast("double"))
+
+def ciclo_from_date(col):
+    """Extrai AAAAMM de campo de data."""
+    return F.regexp_replace(F.substring(col.cast(StringType()), 1, 7), "-", "")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 5. Aglutinar por FATURA + ID_CONTA
+# MAGIC ## 5. Leitura e mapeamento — NG
 # MAGIC
-# MAGIC ### Mapeamento campo a campo (referencia → logica)
-# MAGIC | # | Campo destino         | Origem / Logica                                              |
-# MAGIC |---|----------------------|--------------------------------------------------------------|
-# MAGIC | 1 | FATURA               | fonte.FATURA                                                 |
-# MAGIC | 2 | ID_CONTA             | fonte.ID_CONTA_CONTRATO (cast double)                        |
-# MAGIC | 3 | STATUS               | INCORRETO se qualquer linha INCORRETA, senao CORRETO         |
-# MAGIC | 4 | STATUS_VALIDACAO      | PENDENTE se INCORRETO, VALIDADO se CORRETO                   |
-# MAGIC | 5 | ANALISTA             | null                                                         |
-# MAGIC | 6 | OBSERVACAO           | null                                                         |
-# MAGIC | 7 | PROBLEMA             | Concatenacao de REGRA das linhas INCORRETAS (pipe-separated)  |
-# MAGIC | 8 | VALOR                | SUM(VALOR_BILLING), 0 se nulo                                |
-# MAGIC | 9 | CRIADO_EM            | current_timestamp (string ISO)                                |
-# MAGIC |10 | STATUS_RETORNO       | null                                                         |
-# MAGIC |11 | CHAMADO              | null                                                         |
-# MAGIC |12 | RESUMO               | Concatenacao TAG: obs | SEVERIDADE: substatus                 |
-# MAGIC |13 | Ordem_Status         | 4 se INCORRETO, 1 se CORRETO                                 |
-# MAGIC |14 | DATA_ABERTURA_CHAMADO| current_date                                                  |
-# MAGIC |15 | DT_EMISSAO           | MIN(DT_EMISSAO) do grupo — ou current_date se nulo           |
-# MAGIC |16 | Valor_Positive       | SIM se VALOR > 0, NAO caso contrario                         |
+# MAGIC Campos mapeados:
+# MAGIC - Contrato   : CONTA_NUMERO
+# MAGIC - Fatura     : FATURA_NUMERO
+# MAGIC - CCLASS     : CCLASS (disponível na tabela)
+# MAGIC - CST ICMS   : ICMS_CST
+# MAGIC - CFOP       : CFOP
+# MAGIC - Tributação : ICMS_*, PIS_*, COFINS_*, FUST_*, FUNTTEL_*
+# MAGIC - UF/Cidade  : NF_UF, NF_CIDADE
+# MAGIC - Tipo pessoa: TIPO_ASSINANTE → PF/PJ
 
 # COMMAND ----------
 
-# ---------------------------------------------------------------------------
-# 5a. Coletar PROBLEMAS e RESUMOS das linhas INCORRETAS por fatura/conta
-# ---------------------------------------------------------------------------
+df_ng_raw = (
+    spark.table(TBL_NG)
+    .filter(F.upper(F.trim(F.col("CANCELADA"))) == "NAO")
+    .filter(F.trim(F.col("STATUS_NFCOM")) != "SUBSTITUIÇÃO")
+    .filter(~((F.upper(F.trim(F.col("CATEGORIA_FISCAL"))) == "ICMS") &
+              (F.col("ICMS_BASE_CALCULO").cast("double") == 0)))
+)
+cnt_ng_raw = df_ng_raw.count()
+print(f"NG apos filtros: {cnt_ng_raw:,} registros")
 
-df_problemas = (
-    df_fonte
-    .filter(F.col("STATUS") == "INCORRETO")
-    .groupBy("FATURA", "ID_CONTA_CONTRATO")
-    .agg(
-        # PROBLEMA: concatena REGRA distintas das linhas incorretas
-        F.concat_ws(
-            " | ",
-            F.collect_set(F.col("REGRA"))
-        ).alias("_PROBLEMA"),
-
-        # RESUMO: concatena TAG: observacao | SEVERIDADE: substatus
-        F.concat_ws(
-            " | ",
-            F.collect_list(
-                F.concat(
-                    F.coalesce(F.col("OBSERVACAO"), F.lit("")),
-                )
-            )
-        ).alias("_RESUMO"),
-    )
+df_ng = (
+    df_ng_raw
+    .withColumn("sistema_origem",      F.lit("NG"))
+    .withColumn("ciclo_faturamento",   F.lit(CICLO_NG))
+    .withColumn("dt_carga",            F.current_timestamp())
+    # Identificação
+    .withColumn("id_conta_contrato",   norm_str(F.col("CONTA_NUMERO")))
+    .withColumn("id_cliente",          norm_str(F.col("COD_CLIENTE_SAP")))
+    .withColumn("nome_assinante",      norm_str(F.col("NOME_ASSINANTE")))
+    .withColumn("tipo_pessoa",         norm_str(F.col("TIPO_ASSINANTE")))
+    .withColumn("empresa_prestadora",  norm_str(F.col("EMPRESA_PRESTADORA")))
+    # Fatura e item
+    .withColumn("fatura_numero",       norm_str(F.col("FATURA_NUMERO")))
+    .withColumn("fatura_data_emissao", norm_str(F.col("FATURA_DATA_EMISSAO")))
+    .withColumn("fatura_valor_atual",  norm_dbl(F.col("FATURA_VALOR_ATUAL")))
+    .withColumn("nf_numero",           norm_str(F.col("NF_NUMERO")))
+    .withColumn("nf_valor",            norm_dbl(F.col("NF_VALOR")))
+    .withColumn("nf_item_cod_sap",     norm_str(F.col("NF_ITEM_COD_SAP")))
+    .withColumn("nf_item_descricao",   norm_str(F.col("NF_ITEM_DESCRICAO")))
+    .withColumn("posicao_item",        F.col("POSICAO_ITEM").cast(StringType()))
+    .withColumn("data_inicio_cobranca",norm_str(F.col("DATA_INICIO_COBRANCA")))
+    .withColumn("data_fim_cobranca",   norm_str(F.col("DATA_FIM_COBRANCA")))
+    .withColumn("nf_item_valor",       norm_dbl(F.col("NF_ITEM_VALOR")))
+    # Classificação fiscal — chaves do motor NFCom
+    .withColumn("cclass",              norm_str(F.col("CCLASS")))
+    .withColumn("cfop",               norm_str(F.col("CFOP")))
+    .withColumn("cst_icms",           norm_str(F.col("ICMS_CST")))
+    # Tributação real
+    .withColumn("icms_aliquota",      norm_dbl(F.col("ICMS_ALIQUOTA")))
+    .withColumn("icms_base_calculo",  norm_dbl(F.col("ICMS_BASE_CALCULO")))
+    .withColumn("icms_valor",         norm_dbl(F.col("ICMS_VALOR_IMPOSTO")))
+    .withColumn("iss_aliquota",       norm_dbl(F.col("ISS_ALIQUOTA")))
+    .withColumn("iss_base_calculo",   norm_dbl(F.col("ISS_BASE_CALCULO")))
+    .withColumn("iss_valor",          norm_dbl(F.col("ISS_VALOR_IMPOSTO")))
+    .withColumn("pis_aliquota",       norm_dbl(F.col("PIS_ALIQUOTA")))
+    .withColumn("pis_base_calculo",   norm_dbl(F.col("PIS_BASE_CALCULO")))
+    .withColumn("pis_valor",          norm_dbl(F.col("PIS_VALOR_IMPOSTO")))
+    .withColumn("cofins_aliquota",    norm_dbl(F.col("COFINS_ALIQUOTA")))
+    .withColumn("cofins_base_calculo",norm_dbl(F.col("COFINS_BASE_CALCULO")))
+    .withColumn("cofins_valor",       norm_dbl(F.col("COFINS_VALOR_IMPOSTO")))
+    .withColumn("fust_aliquota",      norm_dbl(F.col("FUST_ALIQUOTA")))
+    .withColumn("fust_base_calculo",  norm_dbl(F.col("FUST_BASE_CALCULO")))
+    .withColumn("fust_valor",         norm_dbl(F.col("FUST_VALOR_IMPOSTO")))
+    .withColumn("funttel_aliquota",   norm_dbl(F.col("FUNTTEL_ALIQUOTA")))
+    .withColumn("funttel_base_calculo",norm_dbl(F.col("FUNTTEL_BASE_CALCULO")))
+    .withColumn("funttel_valor",      norm_dbl(F.col("FUNTTEL_VALOR_IMPOSTO")))
+    # Geográficos
+    .withColumn("nf_uf",              norm_str(F.col("NF_UF")))
+    .withColumn("nf_cidade",          norm_str(F.col("NF_CIDADE")))
+    # Status NFCom
+    .withColumn("status_nfcom",       norm_str(F.col("STATUS_NFCOM")))
+    .withColumn("tipo_emissao_nfcom", norm_str(F.col("TIPO_EMISSAO_NFCOM")))
+    .withColumn("cancelada",          norm_str(F.col("CANCELADA")))
+    .withColumn("nota_substituta",    norm_str(F.col("NOTA_SUBSTITUTA")))
+    .withColumn("nota_substituida",   norm_str(F.col("NOTA_SUBSTITUIDA")))
+    .withColumn("chave_acesso_nfcom", norm_str(F.col("CHAVE_ACESSO_NFCOM")))
+    .withColumn("regime_especial",    norm_str(F.col("REGIME_ESPECIAL")))
 )
 
-# ---------------------------------------------------------------------------
-# 5b. Agregar toda a fonte por FATURA + ID_CONTA_CONTRATO
-# ---------------------------------------------------------------------------
-
-df_agg = (
-    df_fonte
-    .groupBy("FATURA", "ID_CONTA_CONTRATO")
-    .agg(
-        # Pior status do grupo
-        F.max(
-            F.when(F.col("STATUS") == "INCORRETO", F.lit(1)).otherwise(F.lit(0))
-        ).alias("_tem_incorreto"),
-
-        # Soma de VALOR_BILLING (0 se nulo)
-        F.sum(
-            F.coalesce(F.col("VALOR_BILLING").cast(DoubleType()), F.lit(0.0))
-        ).alias("_valor_soma"),
-    )
-)
-
-# ---------------------------------------------------------------------------
-# 5c. JOIN e montar as 16 colunas exatas
-# ---------------------------------------------------------------------------
-
-df_result = (
-    df_agg
-    .join(df_problemas, on=["FATURA", "ID_CONTA_CONTRATO"], how="left")
-    .select(
-        # 1. FATURA (DOUBLE)
-        F.col("FATURA").cast(DoubleType()).alias("FATURA"),
-
-        # 2. ID_CONTA (DOUBLE) — extrai digitos, nullif vazio, try_cast
-        F.when(
-            F.regexp_replace(F.col("ID_CONTA_CONTRATO"), r"[^0-9]", "") != "",
-            F.regexp_replace(F.col("ID_CONTA_CONTRATO"), r"[^0-9]", "").cast(DoubleType())
-        ).otherwise(F.lit(None).cast(DoubleType()))
-         .alias("ID_CONTA"),
-
-        # 3. STATUS
-        F.when(F.col("_tem_incorreto") == 1, F.lit("INCORRETO"))
-         .otherwise(F.lit("CORRETO"))
-         .alias("STATUS"),
-
-        # 4. STATUS_VALIDACAO
-        F.when(F.col("_tem_incorreto") == 1, F.lit("PENDENTE"))
-         .otherwise(F.lit("VALIDADO"))
-         .alias("STATUS_VALIDACAO"),
-
-        # 5. ANALISTA — nulo
-        F.lit(None).cast(StringType()).alias("ANALISTA"),
-
-        # 6. OBSERVACAO — nulo (preenchimento manual posterior)
-        F.lit(None).cast(StringType()).alias("OBSERVACAO"),
-
-        # 7. PROBLEMA — concatenacao das REGRAS incorretas
-        F.when(
-            F.col("_tem_incorreto") == 1,
-            F.coalesce(F.col("_PROBLEMA"), F.lit(""))
-        ).otherwise(F.lit(None).cast(StringType()))
-         .alias("PROBLEMA"),
-
-        # 8. VALOR — soma, 0 se nulo
-        F.coalesce(F.col("_valor_soma"), F.lit(0.0))
-         .cast(DoubleType())
-         .alias("VALOR"),
-
-        # 9. CRIADO_EM — timestamp atual em ISO string
-        F.date_format(F.current_timestamp(), "yyyy-MM-dd'T'HH:mm:ss.SSSXXX")
-         .alias("CRIADO_EM"),
-
-        # 10. STATUS_RETORNO — nulo
-        F.lit(None).cast(StringType()).alias("STATUS_RETORNO"),
-
-        # 11. CHAMADO — nulo
-        F.lit(None).cast(StringType()).alias("CHAMADO"),
-
-        # 12. RESUMO — concatenacao das observacoes
-        F.when(
-            F.col("_tem_incorreto") == 1,
-            F.coalesce(F.col("_RESUMO"), F.lit(""))
-        ).otherwise(F.lit(None).cast(StringType()))
-         .alias("RESUMO"),
-
-        # 13. Ordem_Status — 4=INCORRETO/PENDENTE, 1=CORRETO/VALIDADO
-        F.when(F.col("_tem_incorreto") == 1, F.lit(4))
-         .otherwise(F.lit(1))
-         .cast(IntegerType())
-         .alias("Ordem_Status"),
-
-        # 14. DATA_ABERTURA_CHAMADO — data atual
-        F.current_date().cast(DateType()).alias("DATA_ABERTURA_CHAMADO"),
-
-        # 15. DT_EMISSAO — data atual (ou derivar da fonte se disponivel)
-        F.current_date().cast(DateType()).alias("DT_EMISSAO"),
-
-        # 16. Valor_Positive
-        F.when(
-            F.coalesce(F.col("_valor_soma"), F.lit(0.0)) > 0,
-            F.lit("SIM")
-        ).otherwise(F.lit("NAO"))
-         .alias("Valor_Positive"),
-    )
-)
-
-cnt = df_result.count()
-cnt_i = df_result.filter(F.col("STATUS") == "INCORRETO").count()
-cnt_c = df_result.filter(F.col("STATUS") == "CORRETO").count()
-print(f"Resultado: {cnt:,} faturas | INCORRETO={cnt_i:,} | CORRETO={cnt_c:,}")
+print(f"✅ NG lido: {df_ng_raw.count():,} registros")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 6. Gravar — overwrite do ciclo
+# MAGIC ## 6. Leitura e mapeamento — ADAPTER
+# MAGIC
+# MAGIC Campos mapeados:
+# MAGIC - Contrato   : idcontrato
+# MAGIC - Fatura     : FATURA_NUMERO
+# MAGIC - CCLASS     : **ausente na fonte** — campo nulo, aguarda enriquecimento via catálogo de produtos
+# MAGIC - CST ICMS   : **ausente na fonte** — idem
+# MAGIC - CFOP       : CFOP (disponível)
+# MAGIC - Tributação : ICMS_*, PIS_*, COFINS_*, FUST_*, FUNTTEL_*
+# MAGIC - UF/Cidade  : NF_UF, NF_CIDADE
+# MAGIC - Tipo pessoa: TipoPessoa
 
 # COMMAND ----------
 
-# Limpa registros do ciclo atual (idempotente)
-try:
-    spark.sql(f"DELETE FROM {TBL_DESTINO} WHERE CRIADO_EM >= '{CICLO_REF}-01'")
-except:
-    pass  # Tabela vazia na primeira execucao
+df_adapter_raw = spark.table(TBL_ADAPTER)
 
-# Append
-df_result.write.format("delta").mode("append").saveAsTable(TBL_DESTINO)
+df_adapter = (
+    df_adapter_raw
+    .withColumn("sistema_origem",      F.lit("ADAPTER"))
+    .withColumn("ciclo_faturamento",   F.lit(CICLO_ADAPTER))
+    .withColumn("dt_carga",            F.current_timestamp())
+    # Identificação
+    .withColumn("id_conta_contrato",   norm_str(F.col("idcontrato")))
+    .withColumn("id_cliente",          norm_str(F.col("COD_CLIENTE_SAP")))
+    .withColumn("nome_assinante",      norm_str(F.col("NOME_ASSINANTE")))
+    .withColumn("tipo_pessoa",         norm_str(F.col("TipoPessoa")))
+    .withColumn("empresa_prestadora",  norm_str(F.col("EMPRESA_PRESTADORA")))
+    # Fatura e item
+    .withColumn("fatura_numero",       norm_str(F.col("FATURA_NUMERO")))
+    .withColumn("fatura_data_emissao", norm_str(F.col("FATURA_DATA_EMISSAO")))
+    .withColumn("fatura_valor_atual",  norm_dbl(F.col("FATURA_VALOR_ATUAL")))
+    .withColumn("nf_numero",           norm_str(F.col("NF_NUMERO")))
+    .withColumn("nf_valor",            norm_dbl(F.col("NF_VALOR")))
+    .withColumn("nf_item_cod_sap",     norm_str(F.col("NF_ITEM_COD_SAP")))
+    .withColumn("nf_item_descricao",   norm_str(F.col("NF_ITEM_DESCRICAO")))
+    .withColumn("posicao_item",        F.col("POSICAO_ITEM").cast(StringType()))
+    .withColumn("data_inicio_cobranca",norm_str(F.col("DATA_INICIO_COBRANCA")))
+    .withColumn("data_fim_cobranca",   norm_str(F.col("DATA_FIM_COBRANCA")))
+    .withColumn("nf_item_valor",       norm_dbl(F.col("NF_ITEM_VALOR")))
+    # Classificação fiscal
+    # CCLASS e CST_ICMS ausentes no ADAPTER — virão via JOIN com catálogo de produtos (base de produtos)
+    .withColumn("cclass",              F.lit(None).cast(StringType()))
+    .withColumn("cfop",               norm_str(F.col("CFOP")))
+    .withColumn("cst_icms",           F.lit(None).cast(StringType()))
+    # Tributação real
+    .withColumn("icms_aliquota",      norm_dbl(F.col("ICMS_ALIQUOTA")))
+    .withColumn("icms_base_calculo",  norm_dbl(F.col("ICMS_BASE_CALCULO")))
+    .withColumn("icms_valor",         norm_dbl(F.col("ICMS_VALOR_IMPOSTO")))
+    .withColumn("iss_aliquota",       norm_dbl(F.col("ISS_ALIQUOTA")))
+    .withColumn("iss_base_calculo",   norm_dbl(F.col("ISS_BASE_CALCULO")))
+    .withColumn("iss_valor",          norm_dbl(F.col("ISS_VALOR_IMPOSTO")))
+    .withColumn("pis_aliquota",       norm_dbl(F.col("PIS_ALIQUOTA")))
+    .withColumn("pis_base_calculo",   norm_dbl(F.col("PIS_BASE_CALCULO")))
+    .withColumn("pis_valor",          norm_dbl(F.col("PIS_VALOR_IMPOSTO")))
+    .withColumn("cofins_aliquota",    norm_dbl(F.col("COFINS_ALIQUOTA")))
+    .withColumn("cofins_base_calculo",norm_dbl(F.col("COFINS_BASE_CALCULO")))
+    .withColumn("cofins_valor",       norm_dbl(F.col("COFINS_VALOR_IMPOSTO")))
+    .withColumn("fust_aliquota",      norm_dbl(F.col("FUST_ALIQUOTA")))
+    .withColumn("fust_base_calculo",  norm_dbl(F.col("FUST_BASE_CALCULO")))
+    .withColumn("fust_valor",         norm_dbl(F.col("FUST_VALOR_IMPOSTO")))
+    .withColumn("funttel_aliquota",   norm_dbl(F.col("FUNTTEL_ALIQUOTA")))
+    .withColumn("funttel_base_calculo",norm_dbl(F.col("FUNTTEL_BASE_CALCULO")))
+    .withColumn("funttel_valor",      norm_dbl(F.col("FUNTTEL_VALOR_IMPOSTO")))
+    # Geográficos
+    .withColumn("nf_uf",              norm_str(F.col("NF_UF")))
+    .withColumn("nf_cidade",          norm_str(F.col("NF_CIDADE")))
+    # Status NFCom — campos com nomes diferentes no ADAPTER
+    .withColumn("status_nfcom",       norm_str(F.col("StatusNotaFiscal")))
+    .withColumn("tipo_emissao_nfcom", norm_str(F.col("TipoEmissao")))
+    .withColumn("cancelada",          norm_str(F.col("CANCELADA")))
+    .withColumn("nota_substituta",    F.lit(None).cast(StringType()))
+    .withColumn("nota_substituida",   F.lit(None).cast(StringType()))
+    .withColumn("chave_acesso_nfcom", F.lit(None).cast(StringType()))
+    .withColumn("regime_especial",    F.lit(None).cast(StringType()))
+)
 
-cnt_final = spark.table(TBL_DESTINO).count()
-print(f"Gravado: {cnt_final:,} registros em {TBL_DESTINO}")
+print(f"✅ ADAPTER lido: {df_adapter_raw.count():,} registros")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 7. QA — Resumo
+# MAGIC ## 7. Leitura e mapeamento — SIMETRA
+# MAGIC
+# MAGIC **Tabela ainda não disponível.**
+# MAGIC Slot reservado — quando a tabela `negocio.base_faturamento_simetra` for disponibilizada,
+# MAGIC descomentar o bloco abaixo ajustando os nomes de coluna conforme a estrutura recebida.
+# MAGIC
+# MAGIC Campos esperados (a confirmar):
+# MAGIC - Contrato   : COD_CNTR
+# MAGIC - Fatura     : FT_NFISCAL
+# MAGIC - CCLASS     : CCLASS (interno SIMETRA — pode não ter mapeamento SEFAZ)
+# MAGIC - CST ICMS   : a confirmar
+# MAGIC - CFOP       : a confirmar
+# MAGIC - Tributação : a confirmar
 
 # COMMAND ----------
 
-spark.sql(f"""
-SELECT STATUS, STATUS_VALIDACAO, Ordem_Status,
-    COUNT(*) AS faturas,
-    COUNT(DISTINCT ID_CONTA) AS contas,
-    ROUND(SUM(VALOR), 2) AS valor_total,
-    SUM(CASE WHEN PROBLEMA IS NOT NULL THEN 1 ELSE 0 END) AS com_problema,
-    SUM(CASE WHEN Valor_Positive = 'SIM' THEN 1 ELSE 0 END) AS com_valor
-FROM {TBL_DESTINO}
-GROUP BY STATUS, STATUS_VALIDACAO, Ordem_Status
-ORDER BY Ordem_Status
-""").show(truncate=False)
+# ── SIMETRA — descomentar quando a tabela estiver disponível ─────────────────
+#
+# df_simetra_raw = spark.table(TBL_SIMETRA)
+#
+# df_simetra = (
+#     df_simetra_raw
+#     .withColumn("sistema_origem",      F.lit("SIMETRA"))
+#     .withColumn("ciclo_faturamento",   F.lit(CICLO_SIMETRA))
+#     .withColumn("dt_carga",            F.current_timestamp())
+#     .withColumn("id_conta_contrato",   norm_str(F.col("COD_CNTR")))
+#     .withColumn("id_cliente",          norm_str(F.col("ID_CLIENTE")))
+#     .withColumn("nome_assinante",      norm_str(F.col("NOME_CLIENTE")))
+#     .withColumn("tipo_pessoa",         norm_str(F.col("TP_PESSOA")))
+#     .withColumn("empresa_prestadora",  norm_str(F.col("EMPRESA")))
+#     .withColumn("fatura_numero",       norm_str(F.col("FT_NFISCAL")))
+#     .withColumn("fatura_data_emissao", norm_str(F.col("DT_EMISSAO")))
+#     .withColumn("fatura_valor_atual",  norm_dbl(F.col("VL_FATURA")))
+#     .withColumn("nf_numero",           norm_str(F.col("NF_NUMERO")))
+#     .withColumn("nf_valor",            norm_dbl(F.col("NF_VALOR")))
+#     .withColumn("nf_item_cod_sap",     norm_str(F.col("COD_PRODUTO")))
+#     .withColumn("nf_item_descricao",   norm_str(F.col("DESC_PRODUTO")))
+#     .withColumn("posicao_item",        F.col("POSICAO").cast(StringType()))
+#     .withColumn("data_inicio_cobranca",norm_str(F.col("DT_INI_COBRANCA")))
+#     .withColumn("data_fim_cobranca",   norm_str(F.col("DT_FIM_COBRANCA")))
+#     .withColumn("nf_item_valor",       norm_dbl(F.col("VL_ITEM")))
+#     .withColumn("cclass",              norm_str(F.col("CCLASS")))
+#     .withColumn("cfop",               norm_str(F.col("CFOP")))
+#     .withColumn("cst_icms",           norm_str(F.col("CST_ICMS")))
+#     .withColumn("icms_aliquota",      norm_dbl(F.col("ICMS_ALIQUOTA")))
+#     # ... demais campos tributários
+#     .withColumn("nf_uf",              norm_str(F.col("UF_DEST")))
+#     .withColumn("nf_cidade",          norm_str(F.col("MUNICIPIO_DEST")))
+#     .withColumn("status_nfcom",       F.lit(None).cast(StringType()))
+#     .withColumn("tipo_emissao_nfcom", F.lit(None).cast(StringType()))
+#     .withColumn("cancelada",          norm_str(F.col("CANCELADA")))
+#     .withColumn("nota_substituta",    F.lit(None).cast(StringType()))
+#     .withColumn("nota_substituida",   F.lit(None).cast(StringType()))
+#     .withColumn("chave_acesso_nfcom", F.lit(None).cast(StringType()))
+#     .withColumn("regime_especial",    F.lit(None).cast(StringType()))
+# )
+# ─────────────────────────────────────────────────────────────────────────────
 
-# COMMAND ----------
-
-# Top problemas
-spark.sql(f"""
-SELECT PROBLEMA, COUNT(*) qtd
-FROM {TBL_DESTINO}
-WHERE PROBLEMA IS NOT NULL
-GROUP BY PROBLEMA ORDER BY qtd DESC LIMIT 10
-""").show(truncate=False)
-
-# COMMAND ----------
-
-# Amostra incorretas
-spark.sql(f"""
-SELECT FATURA, ID_CONTA, STATUS, STATUS_VALIDACAO, ANALISTA, OBSERVACAO,
-    PROBLEMA, VALOR, RESUMO, Ordem_Status, Valor_Positive
-FROM {TBL_DESTINO} WHERE STATUS = 'INCORRETO' LIMIT 5
-""").show(truncate=False)
-
-# COMMAND ----------
-
-# Amostra corretas
-spark.sql(f"""
-SELECT FATURA, ID_CONTA, STATUS, STATUS_VALIDACAO, ANALISTA, OBSERVACAO,
-    PROBLEMA, VALOR, Ordem_Status, Valor_Positive
-FROM {TBL_DESTINO} WHERE STATUS = 'CORRETO' LIMIT 5
-""").show(truncate=False)
+print("⚠ SIMETRA: tabela ainda não disponível — slot reservado no job")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 8. Sanidade
+# MAGIC ## 8. Seleção dos campos finais e PK
 
 # COMMAND ----------
 
-checks = []
+COLS_FINAIS = [
+    "id_registro", "sistema_origem", "ciclo_faturamento", "dt_carga",
+    "id_conta_contrato", "id_cliente", "nome_assinante", "tipo_pessoa", "empresa_prestadora",
+    "fatura_numero", "fatura_data_emissao", "fatura_valor_atual",
+    "nf_numero", "nf_valor", "nf_item_cod_sap", "nf_item_descricao",
+    "posicao_item", "data_inicio_cobranca", "data_fim_cobranca", "nf_item_valor",
+    "cclass", "cfop", "cst_icms",
+    "icms_aliquota", "icms_base_calculo", "icms_valor",
+    "iss_aliquota",  "iss_base_calculo",  "iss_valor",
+    "pis_aliquota",  "pis_base_calculo",  "pis_valor",
+    "cofins_aliquota","cofins_base_calculo","cofins_valor",
+    "fust_aliquota", "fust_base_calculo", "fust_valor",
+    "funttel_aliquota","funttel_base_calculo","funttel_valor",
+    "nf_uf", "nf_cidade",
+    "status_nfcom", "tipo_emissao_nfcom", "cancelada",
+    "nota_substituta", "nota_substituida", "chave_acesso_nfcom",
+    "regime_especial", "hash_registro",
+]
 
-# 1. Contagem bate
-n_src = df_fonte.select("FATURA","ID_CONTA_CONTRATO").distinct().count()
-n_dst = spark.table(TBL_DESTINO).count()
-c1 = n_src == n_dst
-checks.append(c1)
-print(f"1. Faturas fonte={n_src:,} vs destino={n_dst:,} {'✅' if c1 else '❌'}")
+def preparar(df, sistema, ciclo):
+    return (
+        df
+        .withColumn("id_registro",
+            F.md5(F.concat_ws("|",
+                F.lit(sistema),
+                F.coalesce(F.col("id_conta_contrato"), F.lit("")),
+                F.coalesce(F.col("fatura_numero"),     F.lit("")),
+                F.coalesce(F.col("nf_item_cod_sap"),   F.lit("")),
+                F.coalesce(F.col("posicao_item"),      F.lit("")),
+                F.lit(ciclo),
+            ))
+        )
+        .withColumn("hash_registro",
+            F.sha2(F.concat_ws("|",
+                F.coalesce(F.col("cclass"),          F.lit("")),
+                F.coalesce(F.col("cfop"),            F.lit("")),
+                F.coalesce(F.col("cst_icms"),        F.lit("")),
+                F.coalesce(F.col("icms_aliquota").cast(StringType()), F.lit("")),
+                F.coalesce(F.col("pis_aliquota").cast(StringType()),  F.lit("")),
+                F.coalesce(F.col("nf_uf"),           F.lit("")),
+            ), 256)
+        )
+        .select(*COLS_FINAIS)
+    )
 
-# 2. ANALISTA sempre nulo
-c2 = spark.sql(f"SELECT COUNT(*) FROM {TBL_DESTINO} WHERE ANALISTA IS NOT NULL").collect()[0][0] == 0
-checks.append(c2)
-print(f"2. ANALISTA sempre nulo: {'✅' if c2 else '❌'}")
+df_ng_final      = preparar(df_ng,      "NG",      CICLO_NG)
+df_adapter_final = preparar(df_adapter, "ADAPTER", CICLO_ADAPTER)
 
-# 3. OBSERVACAO sempre nulo
-c3 = spark.sql(f"SELECT COUNT(*) FROM {TBL_DESTINO} WHERE OBSERVACAO IS NOT NULL").collect()[0][0] == 0
-checks.append(c3)
-print(f"3. OBSERVACAO sempre nulo: {'✅' if c3 else '❌'}")
+# Union das fontes disponíveis
+# Adicionar df_simetra_final quando SIMETRA estiver disponível
+df_union = df_ng_final.union(df_adapter_final)
 
-# 4. VALOR nunca nulo
-c4 = spark.sql(f"SELECT COUNT(*) FROM {TBL_DESTINO} WHERE VALOR IS NULL").collect()[0][0] == 0
-checks.append(c4)
-print(f"4. VALOR nunca nulo: {'✅' if c4 else '❌'}")
+total = df_union.count()
+print(f"✅ Union concluída: {total:,} registros")
+print(f"   NG      : {df_ng_final.count():,}")
+print(f"   ADAPTER : {df_adapter_final.count():,}")
 
-# 5. CORRETO nao tem PROBLEMA
-c5 = spark.sql(f"SELECT COUNT(*) FROM {TBL_DESTINO} WHERE STATUS='CORRETO' AND PROBLEMA IS NOT NULL").collect()[0][0] == 0
-checks.append(c5)
-print(f"5. CORRETO sem PROBLEMA: {'✅' if c5 else '❌'}")
+# COMMAND ----------
 
-# 6. INCORRETO tem PROBLEMA
-c6 = spark.sql(f"SELECT COUNT(*) FROM {TBL_DESTINO} WHERE STATUS='INCORRETO' AND (PROBLEMA IS NULL OR PROBLEMA='')").collect()[0][0] == 0
-checks.append(c6)
-print(f"6. INCORRETO com PROBLEMA: {'✅' if c6 else '❌'}")
+# MAGIC %md
+# MAGIC ## 9. Idempotência — DELETE por sistema + ciclo antes do INSERT
 
-# 7. Schema identico (16 colunas)
-cols_ref = ["FATURA","ID_CONTA","STATUS","STATUS_VALIDACAO","ANALISTA","OBSERVACAO",
-            "PROBLEMA","VALOR","CRIADO_EM","STATUS_RETORNO","CHAMADO","RESUMO",
-            "Ordem_Status","DATA_ABERTURA_CHAMADO","DT_EMISSAO","Valor_Positive"]
-cols_dst = [c.name for c in spark.table(TBL_DESTINO).schema.fields]
-c7 = cols_dst == cols_ref
-checks.append(c7)
-print(f"7. Schema 16 colunas identicas: {'✅' if c7 else '❌'}")
-if not c7:
-    print(f"   Esperado: {cols_ref}")
-    print(f"   Obtido:   {cols_dst}")
+# COMMAND ----------
 
-print(f"\n{'='*60}")
-print(f"{'✅ CARGA OK' if all(checks) else '⚠️ VER ISSUES'}")
+# Apaga apenas os ciclos que serão recarregados — não afeta outros ciclos
+for sistema, ciclo in [("NG", CICLO_NG), ("ADAPTER", CICLO_ADAPTER)]:
+    spark.sql(f"""
+        DELETE FROM {TBL_DEST}
+        WHERE sistema_origem    = '{sistema}'
+          AND ciclo_faturamento = '{ciclo}'
+    """)
+    print(f"✅ DELETE: sistema={sistema} | ciclo={ciclo}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 10. INSERT
+
+# COMMAND ----------
+
+(
+    df_union
+    .write
+    .format("delta")
+    .mode("append")
+    .saveAsTable(TBL_DEST)
+)
+
+print(f"✅ INSERT concluído: {total:,} registros gravados em {TBL_DEST}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 11. QA — Resumo por sistema
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC SELECT
+# MAGIC     sistema_origem,
+# MAGIC     ciclo_faturamento,
+# MAGIC     COUNT(*)                          AS registros,
+# MAGIC     COUNT(DISTINCT id_conta_contrato) AS contratos,
+# MAGIC     COUNT(DISTINCT fatura_numero)     AS faturas,
+# MAGIC     COUNT(DISTINCT nf_item_cod_sap)   AS produtos,
+# MAGIC     SUM(CASE WHEN cclass  IS NULL THEN 1 ELSE 0 END) AS sem_cclass,
+# MAGIC     SUM(CASE WHEN cfop    IS NULL THEN 1 ELSE 0 END) AS sem_cfop,
+# MAGIC     SUM(CASE WHEN cst_icms IS NULL THEN 1 ELSE 0 END) AS sem_cst,
+# MAGIC     SUM(CASE WHEN nf_uf   IS NULL THEN 1 ELSE 0 END) AS sem_uf
+# MAGIC FROM accenture.tab_clientes_nfcom
+# MAGIC GROUP BY sistema_origem, ciclo_faturamento
+# MAGIC ORDER BY sistema_origem
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 12. QA — ADAPTER: produtos sem CCLASS (pendência base de produtos)
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC SELECT
+# MAGIC     nf_item_cod_sap,
+# MAGIC     nf_item_descricao,
+# MAGIC     COUNT(*)              AS ocorrencias,
+# MAGIC     COUNT(DISTINCT fatura_numero) AS faturas
+# MAGIC FROM accenture.tab_clientes_nfcom
+# MAGIC WHERE sistema_origem  = 'ADAPTER'
+# MAGIC   AND cclass IS NULL
+# MAGIC GROUP BY nf_item_cod_sap, nf_item_descricao
+# MAGIC ORDER BY ocorrencias DESC
+# MAGIC LIMIT 50
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 13. QA — NG: distribuição de CCLASS por grupo
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC SELECT
+# MAGIC     cclass,
+# MAGIC     SUBSTR(cclass, 1, 1) AS grupo_cclass,
+# MAGIC     cfop,
+# MAGIC     cst_icms,
+# MAGIC     COUNT(*)             AS ocorrencias,
+# MAGIC     ROUND(AVG(icms_aliquota), 4) AS icms_medio,
+# MAGIC     ROUND(AVG(pis_aliquota),  4) AS pis_medio
+# MAGIC FROM accenture.tab_clientes_nfcom
+# MAGIC WHERE sistema_origem = 'NG'
+# MAGIC GROUP BY cclass, cfop, cst_icms
+# MAGIC ORDER BY ocorrencias DESC
+# MAGIC LIMIT 30

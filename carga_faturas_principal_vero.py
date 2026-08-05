@@ -29,10 +29,11 @@ dbutils.widgets.removeAll()
 dbutils.widgets.text("ciclo_ref", _CICLO_AUTO, "Ciclo (AAAA-MM)")
 CICLO_REF = dbutils.widgets.get("ciclo_ref")
 
-TBL_FONTE   = "accenture.validacao_status_fatura"
-TBL_DESTINO = "accenture.faturas_principal_vero"
+TBL_FONTE    = "accenture.validacao_status_fatura"
+TBL_CLIENTES = "accenture.base_clientes_centralizada"
+TBL_DESTINO  = "accenture.faturas_principal_vero"
 
-print(f"Fonte: {TBL_FONTE} → Destino: {TBL_DESTINO} | Ciclo: {CICLO_REF}")
+print(f"Fonte: {TBL_FONTE} | Clientes: {TBL_CLIENTES} → Destino: {TBL_DESTINO} | Ciclo: {CICLO_REF}")
 
 # COMMAND ----------
 
@@ -55,6 +56,9 @@ spark.sql(f"""
 CREATE TABLE IF NOT EXISTS {TBL_DESTINO} (
     FATURA                  STRING,
     ID_CONTA                STRING,
+    NOME_CLIENTE            STRING,
+    CPF_CNPJ                STRING,
+    ASSET                   STRING,
     STATUS                  STRING,
     STATUS_VALIDACAO        STRING,
     ANALISTA                STRING,
@@ -76,7 +80,12 @@ TBLPROPERTIES (
     'delta.autoOptimize.autoCompact'   = 'true'
 )
 """)
-print(f"DDL {TBL_DESTINO} OK — 16 colunas identicas a faturas_principal_v4")
+for _col_ddl in ["ASSET STRING", "NOME_CLIENTE STRING", "CPF_CNPJ STRING"]:
+    try:
+        spark.sql(f"ALTER TABLE {TBL_DESTINO} ADD COLUMNS ({_col_ddl})")
+    except Exception:
+        pass  # coluna ja existe
+print(f"DDL {TBL_DESTINO} OK — 19 colunas")
 
 # COMMAND ----------
 
@@ -92,6 +101,46 @@ df_fonte = (
 cnt_fonte = df_fonte.count()
 print(f"Fonte: {cnt_fonte:,} linhas no ciclo {CICLO_REF}")
 
+_cli_raw = (
+    spark.table(TBL_CLIENTES)
+    .filter(F.col("nome").isNotNull() & (F.trim(F.col("nome")) != ""))
+)
+
+# Lookup por IDCONTA
+df_cli_conta = (
+    _cli_raw
+    .select(
+        F.col("IDCONTA").cast(StringType()).alias("_k"),
+        F.col("nome").cast(StringType()).alias("NOME_CLIENTE"),
+        F.col("CPF_CNPJ").cast(StringType()).alias("CPF_CNPJ"),
+    )
+    .dropDuplicates(["_k"])
+)
+
+# Lookup por IDCONTRATO (fallback 1)
+df_cli_contrato = (
+    _cli_raw
+    .select(
+        F.col("IDCONTRATO").cast(StringType()).alias("_k2"),
+        F.col("nome").cast(StringType()).alias("NOME_CLIENTE_2"),
+        F.col("CPF_CNPJ").cast(StringType()).alias("CPF_CNPJ_2"),
+    )
+    .dropDuplicates(["_k2"])
+)
+
+# Lookup por CODIGOCLIENTE (fallback 2)
+df_cli_codigo = (
+    _cli_raw
+    .select(
+        F.col("CODIGOCLIENTE").cast(StringType()).alias("_k3"),
+        F.col("nome").cast(StringType()).alias("NOME_CLIENTE_3"),
+        F.col("CPF_CNPJ").cast(StringType()).alias("CPF_CNPJ_3"),
+    )
+    .dropDuplicates(["_k3"])
+)
+
+print(f"Clientes por IDCONTA: {df_cli_conta.count():,} | por IDCONTRATO: {df_cli_contrato.count():,} | por CODIGOCLIENTE: {df_cli_codigo.count():,}")
+
 # COMMAND ----------
 
 # MAGIC %md
@@ -104,7 +153,7 @@ print(f"Fonte: {cnt_fonte:,} linhas no ciclo {CICLO_REF}")
 # MAGIC | 2 | ID_CONTA             | fonte.ID_CONTA_CONTRATO (cast double)                        |
 # MAGIC | 3 | STATUS               | INCORRETO se qualquer linha INCORRETA, senao CORRETO         |
 # MAGIC | 4 | STATUS_VALIDACAO      | PENDENTE se INCORRETO, VALIDADO se CORRETO                   |
-# MAGIC | 5 | ANALISTA             | null                                                         |
+# MAGIC | 5 | ANALISTA             | "PRE-BILLING" se essa regra esta incorreta, senao null        |
 # MAGIC | 6 | OBSERVACAO           | null                                                         |
 # MAGIC | 7 | PROBLEMA             | Concatenacao de REGRA das linhas INCORRETAS (pipe-separated)  |
 # MAGIC | 8 | VALOR                | SUM(VALOR_BILLING), 0 se nulo                                |
@@ -112,7 +161,7 @@ print(f"Fonte: {cnt_fonte:,} linhas no ciclo {CICLO_REF}")
 # MAGIC |10 | STATUS_RETORNO       | null                                                         |
 # MAGIC |11 | CHAMADO              | null                                                         |
 # MAGIC |12 | RESUMO               | Concatenacao TAG: obs | SEVERIDADE: substatus                 |
-# MAGIC |13 | Ordem_Status         | 4 se INCORRETO, 1 se CORRETO                                 |
+# MAGIC |13 | Ordem_Status         | soma ponderada regras distintas incorretas (PRE-BILLING=2, demais=1) |
 # MAGIC |14 | DATA_ABERTURA_CHAMADO| current_date                                                  |
 # MAGIC |15 | DT_EMISSAO           | MIN(DT_EMISSAO) do grupo — ou current_date se nulo           |
 # MAGIC |16 | Valor_Positive       | SIM se VALOR > 0, NAO caso contrario                         |
@@ -157,7 +206,7 @@ df_prep = (
 
 df_agg = (
     df_prep
-    .groupBy("FATURA", "ID_CONTA_CONTRATO")
+    .groupBy("ID_CONTA_CONTRATO")
     .agg(
         # Flag: tem ao menos 1 INCORRETO?
         F.max(
@@ -173,6 +222,20 @@ df_agg = (
         # RESUMO: idem OBSERVACAO
         F.concat_ws(" | ", F.collect_list(F.col("_obs_inc"))).alias("_RESUMO"),
 
+        # Faturas distintas associadas a esta conta
+        F.concat_ws(" | ", F.collect_set(F.col("FATURA"))).alias("_FATURAS"),
+
+        # Sistemas (CRM) distintos associados a esta conta
+        F.concat_ws(" | ", F.collect_set(F.col("CRM"))).alias("_SISTEMAS"),
+
+        # Flag: tem regra PRE-BILLING incorreta? (para campo ANALISTA)
+        F.max(
+            F.when(
+                (F.col("STATUS") == "INCORRETO") & (F.upper(F.trim(F.col("REGRA"))) == F.lit("PRE-BILLING")),
+                F.lit(1)
+            ).otherwise(F.lit(0))
+        ).alias("_tem_prebilling"),
+
         # Soma de VALOR_BILLING (0 se nulo ou vazio)
         F.sum(
             F.coalesce(
@@ -187,19 +250,40 @@ df_agg = (
 )
 
 # ---------------------------------------------------------------------------
+# 5b-bis. Ordem_Status: total de regras distintas por contrato (todas, nao so incorretas)
+# PRE-BILLING = 2, demais = 1. Deduplicar (ID_CONTA_CONTRATO, REGRA) antes de somar.
+# ---------------------------------------------------------------------------
+
+_pesos = (
+    df_prep
+    .select("ID_CONTA_CONTRATO", "REGRA")
+    .dropDuplicates(["ID_CONTA_CONTRATO", "REGRA"])
+    .withColumn("_peso",
+        F.when(F.upper(F.trim(F.col("REGRA"))) == F.lit("PRE-BILLING"), F.lit(2))
+         .otherwise(F.lit(1)))
+    .groupBy("ID_CONTA_CONTRATO")
+    .agg(F.sum("_peso").cast(IntegerType()).alias("_ordem_status"))
+)
+
+df_agg = df_agg.join(_pesos, on="ID_CONTA_CONTRATO", how="left")
+
+# ---------------------------------------------------------------------------
 # 5c. Montar as 16 colunas exatas
 # ---------------------------------------------------------------------------
 
 df_result = (
     df_agg
     .select(
-        # 1. FATURA (STRING)
-        F.col("FATURA").cast(StringType()).alias("FATURA"),
+        # 1. FATURA — faturas distintas da conta (pode ser mais de uma)
+        F.col("_FATURAS").cast(StringType()).alias("FATURA"),
 
         # 2. ID_CONTA (STRING)
         F.col("ID_CONTA_CONTRATO").cast(StringType()).alias("ID_CONTA"),
 
-        # 3. STATUS
+        # 3. ASSET — sistemas (CRM) distintos da conta
+        F.col("_SISTEMAS").cast(StringType()).alias("ASSET"),
+
+        # 5. STATUS
         F.when(F.col("_tem_incorreto") == 1, F.lit("INCORRETO"))
          .otherwise(F.lit("CORRETO"))
          .alias("STATUS"),
@@ -209,8 +293,10 @@ df_result = (
          .otherwise(F.lit("VALIDADO"))
          .alias("STATUS_VALIDACAO"),
 
-        # 5. ANALISTA — nulo
-        F.lit(None).cast(StringType()).alias("ANALISTA"),
+        # 5. ANALISTA — "PRE-BILLING" se essa regra estiver incorreta, senao nulo
+        F.when(F.col("_tem_prebilling") == 1, F.lit("PRE-BILLING"))
+         .otherwise(F.lit(None).cast(StringType()))
+         .alias("ANALISTA"),
 
         # 6. OBSERVACAO — concatena obs das linhas INCORRETAS
         F.when(
@@ -248,10 +334,9 @@ df_result = (
         ).otherwise(F.lit(None).cast(StringType()))
          .alias("RESUMO"),
 
-        # 13. Ordem_Status — 4=INCORRETO/PENDENTE, 1=CORRETO/VALIDADO
-        F.when(F.col("_tem_incorreto") == 1, F.lit(4))
-         .otherwise(F.lit(1))
-         .cast(IntegerType())
+        # 13. Ordem_Status — soma ponderada de regras distintas incorretas
+        # PRE-BILLING=2, demais=1; 0 se nenhuma regra incorreta
+        F.coalesce(F.col("_ordem_status"), F.lit(0)).cast(IntegerType())
          .alias("Ordem_Status"),
 
         # 14. DATA_ABERTURA_CHAMADO — data atual
@@ -269,8 +354,29 @@ df_result = (
     )
 )
 
-# Remove duplicatas por FATURA + ID_CONTA
-df_result = df_result.dropDuplicates(["FATURA", "ID_CONTA"])
+# Remove duplicatas por ID_CONTA
+df_result = df_result.dropDuplicates(["ID_CONTA"])
+
+# JOIN com clientes: tenta IDCONTA → IDCONTRATO → CODIGOCLIENTE
+_base = df_result
+df_result = (
+    _base
+    .join(df_cli_conta,    _base["ID_CONTA"] == df_cli_conta["_k"],    how="left")
+    .join(df_cli_contrato, _base["ID_CONTA"] == df_cli_contrato["_k2"], how="left")
+    .join(df_cli_codigo,   _base["ID_CONTA"] == df_cli_codigo["_k3"],   how="left")
+    .select(
+        _base["FATURA"],
+        _base["ID_CONTA"],
+        F.coalesce(df_cli_conta["NOME_CLIENTE"], df_cli_contrato["NOME_CLIENTE_2"], df_cli_codigo["NOME_CLIENTE_3"]).alias("NOME_CLIENTE"),
+        F.coalesce(df_cli_conta["CPF_CNPJ"],     df_cli_contrato["CPF_CNPJ_2"],     df_cli_codigo["CPF_CNPJ_3"]).alias("CPF_CNPJ"),
+        _base["ASSET"],
+        _base["STATUS"], _base["STATUS_VALIDACAO"], _base["ANALISTA"],
+        _base["OBSERVACAO"], _base["PROBLEMA"], _base["VALOR"], _base["CRIADO_EM"],
+        _base["STATUS_RETORNO"], _base["CHAMADO"], _base["RESUMO"],
+        _base["Ordem_Status"], _base["DATA_ABERTURA_CHAMADO"],
+        _base["DT_EMISSAO"], _base["Valor_Positive"],
+    )
+)
 
 # Somente faturas com STATUS INCORRETO
 df_result = df_result.filter(F.col("STATUS") == "INCORRETO")
@@ -292,7 +398,7 @@ except:
     pass  # Tabela vazia na primeira execucao
 
 # Append somente INCORRETOS unicos
-df_result.write.format("delta").mode("append").saveAsTable(TBL_DESTINO)
+df_result.write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(TBL_DESTINO)
 
 cnt_final = spark.table(TBL_DESTINO).count()
 print(f"Gravado: {cnt_final:,} registros em {TBL_DESTINO} (somente INCORRETO)")
@@ -360,10 +466,10 @@ c1 = n_src == n_dst
 checks.append(c1)
 print(f"1. Faturas fonte={n_src:,} vs destino={n_dst:,} {'✅' if c1 else '❌'}")
 
-# 2. ANALISTA sempre nulo
-c2 = spark.sql(f"SELECT COUNT(*) FROM {TBL_DESTINO} WHERE ANALISTA IS NOT NULL").collect()[0][0] == 0
+# 2. ANALISTA: somente "PRE-BILLING" ou nulo
+c2 = spark.sql(f"SELECT COUNT(*) FROM {TBL_DESTINO} WHERE ANALISTA IS NOT NULL AND ANALISTA != 'PRE-BILLING'").collect()[0][0] == 0
 checks.append(c2)
-print(f"2. ANALISTA sempre nulo: {'✅' if c2 else '❌'}")
+print(f"2. ANALISTA somente PRE-BILLING ou nulo: {'✅' if c2 else '❌'}")
 
 # 3. OBSERVACAO sempre nulo
 c3 = spark.sql(f"SELECT COUNT(*) FROM {TBL_DESTINO} WHERE OBSERVACAO IS NOT NULL").collect()[0][0] == 0
@@ -386,13 +492,13 @@ checks.append(c6)
 print(f"6. INCORRETO com PROBLEMA: {'✅' if c6 else '❌'}")
 
 # 7. Schema identico (16 colunas)
-cols_ref = ["FATURA","ID_CONTA","STATUS","STATUS_VALIDACAO","ANALISTA","OBSERVACAO",
-            "PROBLEMA","VALOR","CRIADO_EM","STATUS_RETORNO","CHAMADO","RESUMO",
-            "Ordem_Status","DATA_ABERTURA_CHAMADO","DT_EMISSAO","Valor_Positive"]
+cols_ref = ["FATURA","ID_CONTA","NOME_CLIENTE","CPF_CNPJ","ASSET","STATUS","STATUS_VALIDACAO",
+            "ANALISTA","OBSERVACAO","PROBLEMA","VALOR","CRIADO_EM","STATUS_RETORNO",
+            "CHAMADO","RESUMO","Ordem_Status","DATA_ABERTURA_CHAMADO","DT_EMISSAO","Valor_Positive"]
 cols_dst = [c.name for c in spark.table(TBL_DESTINO).schema.fields]
 c7 = cols_dst == cols_ref
 checks.append(c7)
-print(f"7. Schema 16 colunas identicas: {'✅' if c7 else '❌'}")
+print(f"7. Schema 19 colunas: {'✅' if c7 else '❌'}")
 if not c7:
     print(f"   Esperado: {cols_ref}")
     print(f"   Obtido:   {cols_dst}")

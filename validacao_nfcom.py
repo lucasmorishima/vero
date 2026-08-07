@@ -26,8 +26,9 @@ dbutils.widgets.text("ciclo_ref", _dt.now().strftime("%Y-%m"), "Ciclo (AAAA-MM)"
 
 CICLO_REF  = dbutils.widgets.get("ciclo_ref")
 
-# ID_Lote no formato YYYY-MM usado pela tabela de resultado
-ID_LOTE = f"{CICLO_REF[:4]}-{CICLO_REF[4:]}"
+# ID_Lote no formato YYYY-MM — normaliza antes: aceita tanto "202607" quanto "2026-07"
+_ciclo_norm = CICLO_REF.replace("-", "")           # garante YYYYMM sem hífen
+ID_LOTE = f"{_ciclo_norm[:4]}-{_ciclo_norm[4:]}"   # sempre YYYY-MM
 dbutils.widgets.text("ciclo_ref_lote", ID_LOTE, "Ciclo lote (AAAA-MM)")
 
 TBL_STANDING  = "accenture.tab_validacoes_NFCOM_v4"
@@ -322,7 +323,13 @@ df = df.withColumn("_vi_cst_incomp",
          .otherwise(F.col("_m_tipo"))
     )
 )
-df = df.withColumn("_vi_cst_nulo", mapeado & item_icms & cst_v)
+# CST_ICMS_NULO: CST vazio para item ICMS
+# EXCEÇÃO: quando CST_MESTRE é 40 (isento) ou 41 (não tributado), a operadora pode
+# legitimamente optar por indSemCST em vez de gICMS40/gICMS41 no XML da NFCom.
+# Ambas abordagens são aceitas pela SEFAZ para itens isentos/não tributados.
+_cst_m_clean = F.regexp_replace(F.trim(F.col("_m_cst").cast(StringType())), r"\.0$", "")
+_cst_mestre_isento = _cst_m_clean.isin("40", "41")
+df = df.withColumn("_vi_cst_nulo", mapeado & item_icms & cst_v & ~_cst_mestre_isento)
 df = df.withColumn("_vi_icms_div", mapeado & item_icms & ~cst_v & adiv(icms_st, F.col("_icms_ref")))
 # PIS: diverge se não bate com cumulativo (0.65) NEM com não-cumulativo (1.65) — em ambos formatos (% e %/100)
 # COALESCE garante que NULL→0, então isNotNull não é mais necessário
@@ -471,7 +478,7 @@ VALIDACOES = [
     ("_vi_cst_incomp",       "CST_INCOMPATIVEL_TRIBUTO",   "VALIDACAO_IMPOSTOS","ALERTA",
      "CST declarado diverge do esperado para o CCLASS conforme tabela mestre fiscal. Existem diversos CST ICMS possiveis (00, 10, 20, 40, 41, 51, 60, 90). Validar enquadramento estadual e decisao fiscal"),
     ("_vi_cst_nulo",         "CST_ICMS_NULO",              "VALIDACAO_IMPOSTOS","BLOQUEANTE",
-     "CST ICMS ausente para item com ICMS aplicavel. CST e campo obrigatorio no XML NFCom quando ha incidencia de ICMS (Rejeicao 539 SEFAZ)"),
+     "CST ICMS ausente para item com ICMS aplicavel (CST obrigatorio). Nao dispara quando CST esperado e 40 (isento) ou 41 (nao tributado) — nesses casos indSemCST e alternativa valida. Rejeicao 539 SEFAZ"),
     ("_vi_icms_div",         "ICMS_DIVERGENTE",            "VALIDACAO_IMPOSTOS","ALERTA",
      "Aliquota ICMS informada diverge da esperada conforme tabela de referencia por UF. Pode haver beneficio fiscal (cBenef), convenio ICMS ou regime especial. Aceita formato percentual e decimal"),
     ("_vi_pis",              "PIS_DIVERGENTE",             "VALIDACAO_IMPOSTOS","ALERTA",
@@ -540,6 +547,10 @@ def _sv(v):
 def _billing_impostos(d):
     """Monta dados_billing para VALIDACAO_IMPOSTOS."""
     return (
+        f"TAG_VALIDADA: {_sv(d.get('_tag'))} | "
+        f"TAG_CST: {_sv(d.get('_tag_cst'))} | "
+        f"TAG_RAW: {_sv(d.get('_tag_raw'))} | "
+        f"TAG_MESTRE: {_sv(d.get('_m_tipo'))} | "
         f"ICMS: {_sv(d.get('ICMS_STANDING'))} | "
         f"PIS: {_sv(d.get('PIS_STANDING'))} | "
         f"COFINS: {_sv(d.get('COFINS_STANDING'))} | "
@@ -572,6 +583,10 @@ def _verdade_impostos(d):
 def _billing_nfcom(d):
     """Monta dados_billing para VALIDACAO_NFCOM."""
     return (
+        f"TAG_VALIDADA: {_sv(d.get('_tag'))} | "
+        f"TAG_CST: {_sv(d.get('_tag_cst'))} | "
+        f"TAG_RAW: {_sv(d.get('_tag_raw'))} | "
+        f"TAG_MESTRE: {_sv(d.get('_m_tipo'))} | "
         f"CCLASS: {_sv(d.get('CCLASS'))} | "
         f"CFOP: {_sv(d.get('CFOP'))} | "
         f"UF_DEST: {_sv(d.get('UF_DEST'))} | "
@@ -656,7 +671,7 @@ cols_base = [
     "ICMS_STANDING","ICMS_ESPERADO","_i_icms","_i_confaz","_i_estadual",
     "PIS_STANDING","COFINS_STANDING","FUST_STANDING","FUNTTEL_STANDING",
     "PIS_ESPERADO","COFINS_ESPERADO","FUST_ESPERADO","FUNTTEL_ESPERADO",
-    "_pis_nc","_cofins_nc","_fust_ref","_ftl_ref","_m_cst","_m_tipo","_tag","_tag_cst","_item_icms","IMPACTO_ICMS_ESTIMADO_R$",
+    "_pis_nc","_cofins_nc","_fust_ref","_ftl_ref","_m_cst","_m_tipo","_tag","_tag_cst","_tag_raw","_item_icms","IMPACTO_ICMS_ESTIMADO_R$",
 ] + [c for c,*_ in VALIDACOES]
 cols_base = list(dict.fromkeys(cols_base))  # remove duplicatas mantendo ordem
 df_base = df.select(*[c for c in cols_base if c in df.columns])
@@ -726,9 +741,16 @@ def explodir_pandas(iterator):
             for cat in ["VALIDACAO_IMPOSTOS", "VALIDACAO_NFCOM"]:
                 items = cats[cat]
                 billing = _billing_impostos(d) if cat == "VALIDACAO_IMPOSTOS" else _billing_nfcom(d)
-                verdade = _verdade_impostos(d) if cat == "VALIDACAO_IMPOSTOS" else _verdade_nfcom(d)
+                verdade_base = _verdade_impostos(d) if cat == "VALIDACAO_IMPOSTOS" else _verdade_nfcom(d)
 
                 if items:
+                    # Monta resumo de TODAS as tags + regras disparadas para este item/categoria
+                    # Formato: TAG_1[SEV] | TAG_2[SEV] | ...
+                    todas_regras = " | ".join(
+                        f"{tag}[{sev}]" for tag, sev, _ in items
+                    )
+                    verdade = f"REGRAS_DISPARADAS({len(items)}): {todas_regras} | {verdade_base}"
+
                     # 1 linha por tag disparada — sem concatenação
                     for tag, sev, obs in items:
                         # STATUS diferenciado por severidade:
@@ -742,7 +764,7 @@ def explodir_pandas(iterator):
                         ))
                 else:
                     # Item sem erro nesta categoria → 1 linha CORRETO/OK
-                    linhas.append(_row(d, cat, "CORRETO", "OK", "Validacoes aprovadas", billing, verdade))
+                    linhas.append(_row(d, cat, "CORRETO", "OK", "Validacoes aprovadas", billing, verdade_base))
 
         if linhas:
             yield pd.DataFrame(linhas, columns=_OUT_COLS)
@@ -792,8 +814,8 @@ if cnt_final == 0: raise Exception("STOP Secao 11: df_final vazio, MERGE nao ser
 
 # COMMAND ----------
 
-# ID_Lote na tabela usa formato YYYY-MM (ex: "2026-07")
-ID_LOTE = f"{CICLO_REF[:4]}-{CICLO_REF[4:]}"
+# ID_Lote na tabela usa formato YYYY-MM (ex: "2026-07") — reutiliza _ciclo_norm
+ID_LOTE = f"{_ciclo_norm[:4]}-{_ciclo_norm[4:]}"
 
 spark.sql(f"""
     DELETE FROM {TBL_RESULTADO}

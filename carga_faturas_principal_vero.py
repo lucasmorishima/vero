@@ -172,29 +172,62 @@ print(f"Clientes por IDCONTA: {df_cli_conta.count():,} | por IDCONTRATO: {df_cli
 # 5a. Preparar colunas auxiliares antes do groupBy
 # ---------------------------------------------------------------------------
 
-# Regras que usam Produto como TAG (em vez de REGRA)
-_REGRAS_TAG_PRODUTO = ["VALOR_OFERTA", "DIVERGENCIA_CONTRATO_PRODUTO", "VALOR ZERADO", "VALOR FATURA"]
+# Colunas opcionais — podem nao existir em versoes antigas da fonte
+_cols_fonte  = df_fonte.columns
+_produto_col = F.col("Produto") if "Produto" in _cols_fonte else F.lit(None).cast(StringType())
+print(f"[INFO] CRM na fonte: {'sim' if 'CRM' in _cols_fonte else 'nao'}  |  Produto: {'sim' if 'Produto' in _cols_fonte else 'nao'}")
+
+# ── listas de TAG alinhadas com carga_detalhes ──────────────────────────────
+# Regras NFCom/Impostos: TAG extraida da OBSERVACAO (formato "NOME_TAG: descricao")
+_REGRAS_TAG_OBS = ["VALIDACAO_NFCOM", "VALIDACAO_IMPOSTOS"]
+
+# Regras cujo TAG é o Produto (em vez da REGRA literal)
+_REGRAS_TAG_PRODUTO = [
+    "ENDERECO_INSTALACAO", "VALOR FATURA", "DIVERGENCIA_CONTRATO_PRODUTO",
+    "VALOR ZERADO", "ENDERECO_LEGAL", "GAP_FATURAMENTO", "PRE BILLING",
+    "DADOS_CADASTRAIS", "FATURAS_NAO_FATURAVEIS", "VALOR_OFERTA",
+]
+
+# Helper: extrai TAG antes do primeiro ":" na OBSERVACAO
+# Ex: "FUST_INCORRETO: FUST diverge..." → "FUST_INCORRETO"
+_tag_from_obs = F.trim(F.split(F.col("OBSERVACAO"), ":").getItem(0))
 
 df_prep = (
     df_fonte
-    # TAG: se REGRA in lista especial → Produto, senao → REGRA
+    # ── 1. Normalizar CRM → _crm_norm (ANTES de qualquer agregacao) ──────────
+    # AN e SIMETRA(AN) sao o mesmo sistema — padronizar para SIMETRA
+    .withColumn("_crm_norm",
+        F.when(
+            F.col("CRM").isNotNull() &
+            F.upper(F.trim(F.col("CRM"))).isin("AN", "SIMETRA(AN)"),
+            F.lit("SIMETRA")
+        ).otherwise(
+            F.when(F.col("CRM").isNotNull(), F.trim(F.col("CRM")))
+        )
+        if "CRM" in _cols_fonte else F.lit(None).cast(StringType())
+    )
+    # TAG: NFCOM/IMPOSTOS → extrai da OBSERVACAO | Produto-rules → Produto | resto → REGRA
     .withColumn("_tag",
         F.when(
+            F.col("REGRA").isin(_REGRAS_TAG_OBS),
+            F.coalesce(_tag_from_obs, F.col("REGRA"))
+        ).when(
             F.col("REGRA").isin(_REGRAS_TAG_PRODUTO),
-            F.coalesce(F.col("Produto"), F.col("REGRA"))
+            F.coalesce(_produto_col, F.col("REGRA"))
         ).otherwise(F.col("REGRA"))
     )
-    # Coluna com REGRA somente quando INCORRETO (para concatenar no PROBLEMA)
+    # Coluna com REGRA quando INCORRETO ou ALERTA (para concatenar no PROBLEMA)
     .withColumn("_regra_inc",
-        F.when(F.col("STATUS") == "INCORRETO", F.col("REGRA"))
+        F.when(F.col("STATUS").isin("INCORRETO", "ALERTA"), F.col("REGRA"))
     )
-    # Coluna com TAG: OBSERVACAO somente quando INCORRETO
+    # Coluna com TAG: OBSERVACAO quando INCORRETO ou ALERTA
     .withColumn("_obs_inc",
         F.when(
-            (F.col("STATUS") == "INCORRETO") & F.col("OBSERVACAO").isNotNull() & (F.trim(F.col("OBSERVACAO")) != ""),
+            F.col("STATUS").isin("INCORRETO", "ALERTA") &
+            F.col("OBSERVACAO").isNotNull() & (F.trim(F.col("OBSERVACAO")) != ""),
             F.concat(F.col("_tag"), F.lit(": "), F.col("OBSERVACAO"))
         ).when(
-            F.col("STATUS") == "INCORRETO",
+            F.col("STATUS").isin("INCORRETO", "ALERTA"),
             F.col("_tag")
         )
     )
@@ -213,6 +246,11 @@ df_agg = (
             F.when(F.col("STATUS") == "INCORRETO", F.lit(1)).otherwise(F.lit(0))
         ).alias("_tem_incorreto"),
 
+        # Flag: tem ao menos 1 ALERTA (sem INCORRETO)?
+        F.max(
+            F.when(F.col("STATUS") == "ALERTA", F.lit(1)).otherwise(F.lit(0))
+        ).alias("_tem_alerta"),
+
         # PROBLEMA: regras distintas das linhas INCORRETAS
         F.concat_ws(" | ", F.collect_set(F.col("_regra_inc"))).alias("_PROBLEMA"),
 
@@ -225,8 +263,10 @@ df_agg = (
         # Faturas distintas associadas a esta conta
         F.concat_ws(" | ", F.collect_set(F.col("FATURA"))).alias("_FATURAS"),
 
-        # Sistemas (CRM) distintos associados a esta conta
-        F.concat_ws(" | ", F.collect_set(F.col("CRM"))).alias("_SISTEMAS"),
+        # Sistema da conta — sempre 1 valor
+        # _crm_norm já foi normalizado por withColumn (AN/SIMETRA(AN)→SIMETRA)
+        # max() garante valor único e determinístico, nunca concatena
+        F.max(F.col("_crm_norm")).alias("_SISTEMAS"),
 
         # Flag: tem regra PRE-BILLING incorreta? (para campo ANALISTA)
         F.max(
@@ -283,14 +323,17 @@ df_result = (
         # 3. ASSET — sistemas (CRM) distintos da conta
         F.col("_SISTEMAS").cast(StringType()).alias("ASSET"),
 
-        # 5. STATUS
+        # 5. STATUS — alinhado com detalhe: INCORRETO > ALERTA > CORRETO
         F.when(F.col("_tem_incorreto") == 1, F.lit("INCORRETO"))
+         .when(F.col("_tem_alerta")    == 1, F.lit("ALERTA"))
          .otherwise(F.lit("CORRETO"))
          .alias("STATUS"),
 
-        # 4. STATUS_VALIDACAO
-        F.when(F.col("_tem_incorreto") == 1, F.lit("PENDENTE"))
-         .otherwise(F.lit("VALIDADO"))
+        # 4. STATUS_VALIDACAO — INCORRETO ou ALERTA → PENDENTE
+        F.when(
+            (F.col("_tem_incorreto") == 1) | (F.col("_tem_alerta") == 1),
+            F.lit("PENDENTE")
+        ).otherwise(F.lit("VALIDADO"))
          .alias("STATUS_VALIDACAO"),
 
         # 5. ANALISTA — "PRE-BILLING" se essa regra estiver incorreta, senao nulo
@@ -378,8 +421,8 @@ df_result = (
     )
 )
 
-# Somente faturas com STATUS INCORRETO
-df_result = df_result.filter(F.col("STATUS") == "INCORRETO")
+# Somente faturas INCORRETO ou ALERTA (ambos geram pendencia de validacao)
+df_result = df_result.filter(F.col("STATUS").isin("INCORRETO", "ALERTA"))
 
 cnt = df_result.count()
 print(f"Resultado: {cnt:,} faturas INCORRETAS (unicas por FATURA+ID_CONTA)")
@@ -471,10 +514,13 @@ c2 = spark.sql(f"SELECT COUNT(*) FROM {TBL_DESTINO} WHERE ANALISTA IS NOT NULL A
 checks.append(c2)
 print(f"2. ANALISTA somente PRE-BILLING ou nulo: {'✅' if c2 else '❌'}")
 
-# 3. OBSERVACAO sempre nulo
-c3 = spark.sql(f"SELECT COUNT(*) FROM {TBL_DESTINO} WHERE OBSERVACAO IS NOT NULL").collect()[0][0] == 0
+# 3. INCORRETO/ALERTA tem STATUS_VALIDACAO = PENDENTE
+c3 = spark.sql(f"""
+    SELECT COUNT(*) FROM {TBL_DESTINO}
+    WHERE STATUS IN ('INCORRETO','ALERTA') AND STATUS_VALIDACAO != 'PENDENTE'
+""").collect()[0][0] == 0
 checks.append(c3)
-print(f"3. OBSERVACAO sempre nulo: {'✅' if c3 else '❌'}")
+print(f"3. INCORRETO/ALERTA → STATUS_VALIDACAO=PENDENTE: {'✅' if c3 else '❌'}")
 
 # 4. VALOR nunca nulo
 c4 = spark.sql(f"SELECT COUNT(*) FROM {TBL_DESTINO} WHERE VALOR IS NULL").collect()[0][0] == 0

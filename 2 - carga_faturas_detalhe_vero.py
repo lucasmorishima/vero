@@ -97,25 +97,56 @@ df_fonte = (
     .filter(F.col("ID_Lote") == CICLO_REF)
 )
 cnt_fonte = df_fonte.count()
+print(f"[DIAG 1] Fonte bruta (ID_Lote='{CICLO_REF}'): {cnt_fonte:,}")
+
+# Distribuicao de ID_Lote na fonte — confirma que o ciclo esta correto
+print("[DIAG 2] ID_Lote distintos na fonte:")
+df_fonte.groupBy("ID_Lote").count().orderBy("ID_Lote").show(truncate=False)
+
+# Distribuicao de REGRA na fonte — confirma que NFCOM/IMPOSTOS existem
+print("[DIAG 3] REGRAs na fonte:")
+df_fonte.groupBy("REGRA").count().orderBy("REGRA").show(truncate=False)
+
+if cnt_fonte == 0:
+    raise Exception(f"STOP: fonte vazia para ID_Lote='{CICLO_REF}' — verifique o ciclo")
 
 # Filtro: somente contas que existem na principal (INCORRETAS)
+# EXCECAO: VALIDACAO_NFCOM e VALIDACAO_IMPOSTOS carregam integralmente —
+# essas regras nao passam pela principal pois sao geradas por pipeline proprio
 TBL_PRINCIPAL = "accenture.faturas_principal_vero"
+# faturas_principal_vero nao tem coluna CRM (tem ASSET = CRM concatenado).
+# O filtro so precisa verificar se a conta existe na principal — join por ID_CONTA basta.
 df_principal = spark.table(TBL_PRINCIPAL).select(
-    F.col("ID_CONTA").alias("_p_cta")
+    F.col("ID_CONTA").cast(StringType()).alias("_p_cta")
 ).dropDuplicates(["_p_cta"])
 
-df_fonte = (
-    df_fonte
+_REGRAS_DIRETAS = ["VALIDACAO_NFCOM", "VALIDACAO_IMPOSTOS"]
+
+# Split: NFCOM/IMPOSTOS passam direto; demais filtradas pela principal
+df_diretas = df_fonte.filter(F.col("REGRA").isin(_REGRAS_DIRETAS))
+df_outras   = df_fonte.filter(~F.col("REGRA").isin(_REGRAS_DIRETAS))
+
+cnt_diretas_pre = df_diretas.count()
+print(f"[DIAG 4] NFCOM/IMPOSTOS antes do union: {cnt_diretas_pre:,}")
+print("[DIAG 5] NFCOM/IMPOSTOS por REGRA+STATUS:")
+df_diretas.groupBy("REGRA","STATUS").count().orderBy("REGRA","STATUS").show(truncate=False)
+
+df_outras = (
+    df_outras
     .join(
         df_principal,
-        df_fonte["ID_CONTA_CONTRATO"].cast(StringType()) == df_principal["_p_cta"],
+        df_outras["ID_CONTA_CONTRATO"].cast(StringType()) == df_principal["_p_cta"],
         how="inner"
     )
     .drop("_p_cta")
 )
 
-cnt_filtrado = df_fonte.count()
-print(f"Fonte total: {cnt_fonte:,} | Apos filtro pela principal: {cnt_filtrado:,}")
+# union por nome para evitar mistura de colunas por posicao
+df_fonte = df_diretas.unionByName(df_outras)
+
+cnt_filtrado  = df_fonte.count()
+cnt_outras    = df_outras.count()
+print(f"[DIAG 6] Apos union — NFCOM/IMPOSTOS: {cnt_diretas_pre:,} | Outras: {cnt_outras:,} | Total: {cnt_filtrado:,}")
 
 # COMMAND ----------
 
@@ -157,8 +188,33 @@ print(f"Fonte total: {cnt_fonte:,} | Apos filtro pela principal: {cnt_filtrado:,
 
 _null = F.lit(None).cast(StringType())
 
+# ---------------------------------------------------------------------------
+# Normalizacao do sistema (CRM → ASSET)
+# SIMETRA(AN) e AN sao o mesmo sistema — padronizar para SIMETRA
+# ---------------------------------------------------------------------------
+def _norm_crm(col):
+    return (
+        F.when(F.upper(F.trim(col)).isin("AN", "SIMETRA(AN)"), F.lit("SIMETRA"))
+         .otherwise(F.coalesce(F.trim(col), F.lit("NAO_IDENTIFICADO")))
+    )
+
 # Regras que usam Produto como TAG
-_REGRAS_TAG_PRODUTO = ["VALOR_OFERTA", "DIVERGENCIA_CONTRATO_PRODUTO", "VALOR ZERADO", "VALOR FATURA"]
+_REGRAS_TAG_PRODUTO = ["ENDERECO_INSTALACAO",
+"VALOR FATURA",
+"DIVERGENCIA_CONTRATO_PRODUTO",
+"VALOR ZERADO",
+"ENDERECO_LEGAL",
+"GAP_FATURAMENTO",
+"PRE BILLING",
+"DADOS_CADASTRAIS",
+"FATURAS_NAO_FATURAVEIS"]
+
+# Regras NFCom/Impostos: TAG extraida da OBSERVACAO (formato "TAG_NAME: descricao")
+_REGRAS_TAG_OBS = ["VALIDACAO_NFCOM", "VALIDACAO_IMPOSTOS"]
+
+# Helper: extrai a TAG antes do primeiro ":" na OBSERVACAO
+# Ex: "CFOP_INVALIDO: CFOP fora da lista..." → "CFOP_INVALIDO"
+_tag_from_obs = F.trim(F.split(F.col("OBSERVACAO"), ":").getItem(0))
 
 df_result = (
     df_fonte
@@ -169,8 +225,8 @@ df_result = (
         # 2. ID_CONTA
         F.col("ID_CONTA_CONTRATO").cast(StringType()).alias("ID_CONTA"),
 
-        # 3. ASSET (sistema origem)
-        F.coalesce(F.col("CRM"), F.lit("NAO_IDENTIFICADO")).alias("ASSET"),
+        # 3. ASSET (sistema origem — normalizado: AN / SIMETRA(AN) → SIMETRA)
+        _norm_crm(F.col("CRM")).alias("ASSET"),
 
         # 4. REGRA
         F.col("REGRA").cast(StringType()).alias("REGRA"),
@@ -186,10 +242,14 @@ df_result = (
 
         # 8. DADOS_KENAN — condicional por REGRA (com fallback para nao ficar nulo)
         #    BATIMENTO_PRODUTOS_FATURA → VALOR_CONTRATO
-        #    VALOR FATURA / VALOR ZERADO → VALOR_BILLING
-        #    Demais → DADOS_BILLING
+        #    DIVERGENCIA_CONTRATO_PRODUTO → DADOS_CONTRATO (descricao billing do contrato)
+        #    BATIMENTO_PRODUTOS_FATURA    → VALOR_CONTRATO
+        #    VALOR FATURA / VALOR ZERADO  → VALOR_BILLING
+        #    Demais                       → DADOS_BILLING
         F.coalesce(
-            F.when(F.col("REGRA") == "BATIMENTO_PRODUTOS_FATURA",
+            F.when(F.col("REGRA") == "DIVERGENCIA_CONTRATO_PRODUTO",
+                   F.col("DADOS_CONTRATO").cast(StringType()))
+             .when(F.col("REGRA") == "BATIMENTO_PRODUTOS_FATURA",
                    F.col("VALOR_CONTRATO").cast(StringType()))
              .when(F.col("REGRA").isin("VALOR FATURA", "VALOR ZERADO"),
                    F.col("VALOR_BILLING").cast(StringType()))
@@ -200,10 +260,14 @@ df_result = (
         ).alias("DADOS_KENAN"),
 
         # 9. DADOS_TABELA_VERDADE — condicional por REGRA (com fallback)
-        #    DIVERGENCIA_CONTRATO_PRODUTO / VALOR FATURA / VALOR ZERADO → logica especifica
-        #    Demais → DADOS_CONTRATO se preenchido, senao DADOS_TABELA_VERDADE
+        #    DIVERGENCIA_CONTRATO_PRODUTO → DADOS_TABELA_VERDADE direto (verdade do produto esperado)
+        #    VALOR FATURA / VALOR ZERADO  → VALOR_CONTRATO
+        #    Demais                       → DADOS_CONTRATO se preenchido, senao DADOS_TABELA_VERDADE
         F.when(
-            F.col("REGRA").isin("DIVERGENCIA_CONTRATO_PRODUTO", "VALOR FATURA", "VALOR ZERADO"),
+            F.col("REGRA") == "DIVERGENCIA_CONTRATO_PRODUTO",
+            F.col("DADOS_TABELA_VERDADE").cast(StringType())
+        ).when(
+            F.col("REGRA").isin("VALOR FATURA", "VALOR ZERADO"),
             F.coalesce(
                 F.col("VALOR_CONTRATO").cast(StringType()),
                 F.col("DADOS_TABELA_VERDADE").cast(StringType())
@@ -246,14 +310,20 @@ df_result = (
         F.col("Grupo_Localidade").cast(StringType()).alias("GRUPO"),
 
         # 19. STATUS_VALIDACAO
-        F.when(F.col("STATUS") == "INCORRETO", F.lit("PENDENTE"))
+        #     INCORRETO → PENDENTE | ALERTA → PENDENTE | CORRETO → VALIDADO
+        F.when(F.col("STATUS").isin("INCORRETO", "ALERTA"), F.lit("PENDENTE"))
          .otherwise(F.lit("VALIDADO"))
          .alias("STATUS_VALIDACAO"),
 
-        # 20. TAG — regra especial: VALOR_OFERTA/DIVERGENCIA/ZERADO → Produto, senao → REGRA
+        # 20. TAG — INCORRETO e ALERTA recebem TAG; CORRETO recebe null
+        #     NFCOM/IMPOSTOS → extrai da OBSERVACAO (antes do ":")
+        #     demais regras com Produto → Produto | restante → REGRA
         F.when(
-            F.col("STATUS") == "INCORRETO",
+            F.col("STATUS").isin("INCORRETO", "ALERTA"),
             F.when(
+                F.col("REGRA").isin(_REGRAS_TAG_OBS),
+                F.coalesce(_tag_from_obs, F.col("REGRA"))
+            ).when(
                 F.col("REGRA").isin(_REGRAS_TAG_PRODUTO),
                 F.coalesce(F.col("Produto"), F.col("REGRA"))
             ).otherwise(F.col("REGRA"))
@@ -267,25 +337,36 @@ df_result = (
         _null.alias("CHAMADO"),
 
         # 23. RESUMO — TAG | OBSERVACAO
+        #     TAG calculada igual à coluna 20 (NFCOM/IMPOSTOS → obs, Produto → produto, resto → regra)
         F.when(
             F.col("OBSERVACAO").isNotNull() & (F.trim(F.col("OBSERVACAO")) != ""),
             F.concat(
-                F.when(F.col("REGRA").isin(_REGRAS_TAG_PRODUTO), F.coalesce(F.col("Produto"), F.col("REGRA"))).otherwise(F.col("REGRA")),
+                F.when(F.col("REGRA").isin(_REGRAS_TAG_OBS),
+                       F.coalesce(_tag_from_obs, F.col("REGRA")))
+                 .when(F.col("REGRA").isin(_REGRAS_TAG_PRODUTO),
+                       F.coalesce(F.col("Produto"), F.col("REGRA")))
+                 .otherwise(F.col("REGRA")),
                 F.lit(" | "),
                 F.col("OBSERVACAO")
             )
         ).otherwise(
-            F.when(F.col("REGRA").isin(_REGRAS_TAG_PRODUTO), F.coalesce(F.col("Produto"), F.col("REGRA"))).otherwise(F.col("REGRA"))
+            F.when(F.col("REGRA").isin(_REGRAS_TAG_OBS),
+                   F.coalesce(_tag_from_obs, F.col("REGRA")))
+             .when(F.col("REGRA").isin(_REGRAS_TAG_PRODUTO),
+                   F.coalesce(F.col("Produto"), F.col("REGRA")))
+             .otherwise(F.col("REGRA"))
         ).alias("RESUMO"),
 
-        # 24. _Ordem_Status_DET
+        # 24. _Ordem_Status_DET  — INCORRETO=3, ALERTA=2, CORRETO=1
         F.when(F.col("STATUS") == "INCORRETO", F.lit(3))
+         .when(F.col("STATUS") == "ALERTA",    F.lit(2))
          .otherwise(F.lit(1))
          .cast(IntegerType())
          .alias("_Ordem_Status_DET"),
 
-        # 25. _Prioridade_Final_da_Fatura
+        # 25. _Prioridade_Final_da_Fatura — INCORRETO=4, ALERTA=3, CORRETO=1
         F.when(F.col("STATUS") == "INCORRETO", F.lit(4))
+         .when(F.col("STATUS") == "ALERTA",    F.lit(3))
          .otherwise(F.lit(1))
          .cast(IntegerType())
          .alias("_Prioridade_Final_da_Fatura"),
@@ -306,6 +387,10 @@ df_result = (
 df_result = df_result.dropDuplicates()
 
 cnt = df_result.count()
+print(f"[DIAG 7] Apos select+dedup: {cnt:,} linhas")
+print("[DIAG 8] NFCOM/IMPOSTOS no resultado apos select+dedup:")
+df_result.filter(F.col("REGRA").isin("VALIDACAO_NFCOM","VALIDACAO_IMPOSTOS")) \
+    .groupBy("REGRA","STATUS","SUBSTATUS").count().orderBy("REGRA","STATUS").show(truncate=False)
 print(f"Resultado: {cnt:,} linhas (espelho 1:1, esperado {cnt_fonte:,})")
 
 # COMMAND ----------
@@ -325,6 +410,15 @@ df_result.write.format("delta").mode("append").saveAsTable(TBL_DESTINO)
 
 cnt_final = spark.table(TBL_DESTINO).count()
 print(f"Gravado: {cnt_final:,} registros em {TBL_DESTINO}")
+
+print(f"[DIAG 9] NFCOM/IMPOSTOS gravados em {TBL_DESTINO} (ID_LOTE='{CICLO_REF}'):")
+spark.sql(f"""
+    SELECT REGRA, STATUS, SUBSTATUS, COUNT(*) n, COUNT(DISTINCT FATURA) fat
+    FROM {TBL_DESTINO}
+    WHERE ID_LOTE = '{CICLO_REF}'
+      AND REGRA IN ('VALIDACAO_NFCOM','VALIDACAO_IMPOSTOS')
+    GROUP BY 1,2,3 ORDER BY 1,2
+""").show(truncate=False)
 
 # COMMAND ----------
 
@@ -398,22 +492,23 @@ if not c2:
     print(f"   Obtido:   {cols_dst}")
 
 # 3. STATUS_VALIDACAO consistente
+#    INCORRETO/ALERTA → PENDENTE | CORRETO → VALIDADO
 c3 = spark.sql(f"""
     SELECT COUNT(*) FROM {TBL_DESTINO}
     WHERE ID_LOTE='{CICLO_REF}'
-    AND ((STATUS='INCORRETO' AND STATUS_VALIDACAO!='PENDENTE')
+    AND ((STATUS IN ('INCORRETO','ALERTA') AND STATUS_VALIDACAO!='PENDENTE')
       OR (STATUS='CORRETO' AND STATUS_VALIDACAO!='VALIDADO'))
 """).collect()[0][0] == 0
 checks.append(c3)
 print(f"3. STATUS_VALIDACAO consistente: {'✅' if c3 else '❌'}")
 
-# 4. INCORRETO tem TAG preenchida
+# 4. INCORRETO e ALERTA têm TAG preenchida
 c4 = spark.sql(f"""
     SELECT COUNT(*) FROM {TBL_DESTINO}
-    WHERE ID_LOTE='{CICLO_REF}' AND STATUS='INCORRETO' AND (TAG IS NULL OR TAG='')
+    WHERE ID_LOTE='{CICLO_REF}' AND STATUS IN ('INCORRETO','ALERTA') AND (TAG IS NULL OR TAG='')
 """).collect()[0][0] == 0
 checks.append(c4)
-print(f"4. INCORRETO com TAG: {'✅' if c4 else '❌'}")
+print(f"4. INCORRETO/ALERTA com TAG: {'✅' if c4 else '❌'}")
 
 # 5. _FILTRA_PAGE preenchido
 c5 = spark.sql(f"""

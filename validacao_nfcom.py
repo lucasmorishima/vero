@@ -72,7 +72,8 @@ spark.conf.set("spark.sql.shuffle.partitions","200")
 
 df_st = (spark.table(TBL_STANDING)
     .withColumn("_ciclo", F.regexp_replace(F.trim(F.col("CICLO").cast(StringType())),"-",""))
-    .filter(F.col("_ciclo") == CICLO_REF.replace("-","")))
+    .filter(F.col("_ciclo") == CICLO_REF.replace("-",""))
+    .withColumnRenamed("sistem_origem", "SISTEMA_ORIGEM"))
 
 df_im = spark.table(TBL_IMPOSTOS)
 df_ms = spark.table(TBL_MESTRE)
@@ -853,6 +854,7 @@ df_insert = df_final.select(
     F.lit(None).cast("double")                                      .alias("VALOR_TABELA_VERDADE"),
     F.lit(None).cast("string")                                      .alias("DESCONTOS_NOMES"),
     F.lit(None).cast("string")                                      .alias("dt_cancelamento"),
+    F.lit("NFCOM")                                                   .alias("SEGMENTO"),
 )
 
 df_insert.write.format("delta").mode("append").saveAsTable(TBL_RESULTADO)

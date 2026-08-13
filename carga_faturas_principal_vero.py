@@ -72,7 +72,8 @@ CREATE TABLE IF NOT EXISTS {TBL_DESTINO} (
     Ordem_Status            INT,
     DATA_ABERTURA_CHAMADO   DATE,
     DT_EMISSAO              DATE,
-    Valor_Positive          STRING
+    Valor_Positive          STRING,
+    ID_LOTE                 STRING
 )
 USING DELTA
 TBLPROPERTIES (
@@ -80,12 +81,12 @@ TBLPROPERTIES (
     'delta.autoOptimize.autoCompact'   = 'true'
 )
 """)
-for _col_ddl in ["ASSET STRING", "NOME_CLIENTE STRING", "CPF_CNPJ STRING"]:
+for _col_ddl in ["ASSET STRING", "NOME_CLIENTE STRING", "CPF_CNPJ STRING", "ID_LOTE STRING"]:
     try:
         spark.sql(f"ALTER TABLE {TBL_DESTINO} ADD COLUMNS ({_col_ddl})")
     except Exception:
         pass  # coluna ja existe
-print(f"DDL {TBL_DESTINO} OK — 19 colunas")
+print(f"DDL {TBL_DESTINO} OK — 20 colunas")
 
 # COMMAND ----------
 
@@ -181,12 +182,21 @@ print(f"[INFO] CRM na fonte: {'sim' if 'CRM' in _cols_fonte else 'nao'}  |  Prod
 # Regras NFCom/Impostos: TAG extraida da OBSERVACAO (formato "NOME_TAG: descricao")
 _REGRAS_TAG_OBS = ["VALIDACAO_NFCOM", "VALIDACAO_IMPOSTOS"]
 
-# Regras cujo TAG é o Produto (em vez da REGRA literal)
+# Regras cujo TAG é o nome do Produto (em vez da REGRA literal)
+# Sincronizado com carga_faturas_detalhe_vero e carga_tag_detalhes_vero
 _REGRAS_TAG_PRODUTO = [
-    "ENDERECO_INSTALACAO", "VALOR FATURA", "DIVERGENCIA_CONTRATO_PRODUTO",
-    "VALOR ZERADO", "ENDERECO_LEGAL", "GAP_FATURAMENTO", "PRE BILLING",
-    "DADOS_CADASTRAIS", "FATURAS_NAO_FATURAVEIS", "VALOR_OFERTA",
+    "VALOR_OFERTA",
+    "VALOR FATURA",
+    "VALOR ZERADO",
+    "VALOR_ZERADO",
+    "PRE BILLING",
+    "PRE-BILLING",
+    "DIVERGENCIA_CONTRATO_PRODUTO",
 ]
+# Regras que usam a propria REGRA como TAG (fallback .otherwise)
+# — filtradas pelo principal normalmente (pipeline principal):
+#   VALIDACAO_ENCARGOS_MULTA_JUROS, GAP_FATURAMENTO, FATURAS_NAO_FATURAVEIS,
+#   ENDERECO_LEGAL, DADOS_CADASTRAIS, ENDERECO_INSTALACAO
 
 # Helper: extrai TAG antes do primeiro ":" na OBSERVACAO
 # Ex: "FUST_INCORRETO: FUST diverge..." → "FUST_INCORRETO"
@@ -394,6 +404,9 @@ df_result = (
             F.lit("SIM")
         ).otherwise(F.lit("NAO"))
          .alias("Valor_Positive"),
+
+        # 17. ID_LOTE — ciclo de referencia (filtro de ano/mes)
+        F.lit(CICLO_REF).cast(StringType()).alias("ID_LOTE"),
     )
 )
 
@@ -434,7 +447,8 @@ print(f"Resultado: {cnt:,} faturas INCORRETAS (unicas por FATURA+ID_CONTA)")
 
 # COMMAND ----------
 
-# Limpa ciclo atual (idempotente)
+# Tabela de estado corrente: full DELETE antes de cada carga
+# (sempre reflete o ciclo atual — nao e historico como detalhes/tag)
 try:
     spark.sql(f"DELETE FROM {TBL_DESTINO}")
 except:

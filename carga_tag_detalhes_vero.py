@@ -96,31 +96,50 @@ df_fonte = (
     .filter(F.col("ID_Lote") == CICLO_REF)
 )
 cnt_total = df_fonte.count()
+print(f"[DIAG 1] Fonte bruta (ID_Lote='{CICLO_REF}'): {cnt_total:,}")
 
-# Filtro 1: somente contas que existem na principal (INCORRETAS)
+# Principal e tabela de estado corrente (full DELETE + reload a cada ciclo):
+# le sem filtro de lote — sempre reflete o ciclo mais recente carregado.
+# (NFCOM/IMPOSTOS/ENCARGOS bypassam esse join via _REGRAS_DIRETAS)
 TBL_PRINCIPAL = "accenture.faturas_principal_vero"
 df_principal = spark.table(TBL_PRINCIPAL).select(
-    F.col("ID_CONTA").alias("_p_cta")
+    F.col("ID_CONTA").cast(StringType()).alias("_p_cta")
 ).dropDuplicates(["_p_cta"])
 
-df_fonte = (
-    df_fonte
+# Regras diretas: carregam integralmente sem filtro pela principal
+# — geradas por pipelines proprios; garante alinhamento com detalhes_da_fatura_vero para JOIN.
+_REGRAS_DIRETAS = ["VALIDACAO_NFCOM", "VALIDACAO_IMPOSTOS", "VALIDACAO_ENCARGOS_MULTA_JUROS"]
+
+df_diretas = df_fonte.filter(F.col("REGRA").isin(_REGRAS_DIRETAS))
+df_outras   = df_fonte.filter(~F.col("REGRA").isin(_REGRAS_DIRETAS))
+
+df_outras = (
+    df_outras
     .join(
         df_principal,
-        df_fonte["ID_CONTA_CONTRATO"].cast(StringType()) == df_principal["_p_cta"],
+        df_outras["ID_CONTA_CONTRATO"].cast(StringType()) == df_principal["_p_cta"],
         how="inner"
     )
     .drop("_p_cta")
 )
 
-# Filtro 2: somente INCORRETO com OBSERVACAO (que gera TAG)
-df_com_tag = (
-    df_fonte
-    .filter(F.col("STATUS") == "INCORRETO")
-    .filter(F.col("OBSERVACAO").isNotNull() & (F.trim(F.col("OBSERVACAO")) != ""))
-)
-cnt_tag = df_com_tag.count()
-print(f"Fonte total: {cnt_total:,} | Na principal: {df_fonte.count():,} | Com TAG: {cnt_tag:,}")
+# Union por nome (evita mistura de colunas por posicao)
+df_fonte = df_diretas.unionByName(df_outras)
+
+# Filtro final: INCORRETO e ALERTA — TAG sempre preenchida (Produto, OBSERVACAO ou propria REGRA)
+df_com_tag  = df_fonte.filter(F.col("STATUS").isin("INCORRETO", "ALERTA"))
+cnt_tag     = df_com_tag.count()
+cnt_dir_tag = df_diretas.filter(F.col("STATUS").isin("INCORRETO", "ALERTA")).count()
+print(f"[DIAG 2] Diretas (NFCOM/IMPOSTOS/ENCARGOS) INCORRETO/ALERTA: {cnt_dir_tag:,} | Demais: {cnt_tag - cnt_dir_tag:,} | Total: {cnt_tag:,}")
+
+# Breakdown das diretas por REGRA — mostra se ENCARGOS tem dados na fonte
+print("[DIAG 2b] Breakdown das diretas por REGRA+STATUS:")
+df_diretas.groupBy("REGRA", "STATUS").count().orderBy("REGRA", "STATUS").show(truncate=False)
+
+# Breakdown das demais por REGRA — mostra todas as regras que passaram pelo join
+print("[DIAG 2c] Breakdown das demais (via principal) por REGRA:")
+df_outras.filter(F.col("STATUS").isin("INCORRETO", "ALERTA")) \
+    .groupBy("REGRA").count().orderBy("REGRA").show(truncate=False)
 
 # COMMAND ----------
 
@@ -133,7 +152,7 @@ print(f"Fonte total: {cnt_total:,} | Na principal: {df_fonte.count():,} | Com TA
 # MAGIC | 2 | ID_CONTA                  | ID_CONTA_CONTRATO       | direto                              |
 # MAGIC | 3 | ASSET                     | CRM                     | sistema origem                      |
 # MAGIC | 4 | REGRA                     | REGRA                   | direto                              |
-# MAGIC | 5 | STATUS                    | STATUS                  | direto (sempre INCORRETO)           |
+# MAGIC | 5 | STATUS                    | STATUS                  | direto (INCORRETO ou ALERTA)        |
 # MAGIC | 6 | SUBSTATUS                 | SUBSTATUS               | direto                              |
 # MAGIC | 7 | OBSERVACAO                | OBSERVACAO              | direto                              |
 # MAGIC | 8 | DADOS_KENAN               | DADOS_BILLING           | renomear                            |
@@ -147,8 +166,8 @@ print(f"Fonte total: {cnt_total:,} | Na principal: {df_fonte.count():,} | Com TA
 # MAGIC |16 | TIPO_IMPOSTO              | Tipo_Imposto            | direto                              |
 # MAGIC |17 | PROMOCAO                  | Promocao                | direto                              |
 # MAGIC |18 | GRUPO                     | Grupo_Localidade        | direto                              |
-# MAGIC |19 | STATUS_VALIDACAO          | —                       | PENDENTE (todos sao INCORRETO)      |
-# MAGIC |20 | TAG                       | OBSERVACAO              | texto antes do primeiro ":"         |
+# MAGIC |19 | STATUS_VALIDACAO          | —                       | PENDENTE (INCORRETO ou ALERTA)      |
+# MAGIC |20 | TAG                       | OBSERVACAO / Produto / REGRA | NFCOM/IMPOSTOS→obs; Produto→produto; demais→REGRA |
 # MAGIC |21 | ANALISTA                  | —                       | nulo                                |
 # MAGIC |22 | STATUS_RETORNO            | —                       | nulo                                |
 # MAGIC |23 | CHAMADO                   | —                       | nulo                                |
@@ -161,8 +180,26 @@ print(f"Fonte total: {cnt_total:,} | Na principal: {df_fonte.count():,} | Com TA
 
 _null = F.lit(None).cast(StringType())
 
-# Regras que usam Produto como TAG
-_REGRAS_TAG_PRODUTO = ["VALOR_OFERTA", "DIVERGENCIA_CONTRATO_PRODUTO", "VALOR ZERADO", "VALOR FATURA"]
+# Regras que usam o nome do Produto como TAG  (sincronizado com carga_faturas_detalhe_vero)
+_REGRAS_TAG_PRODUTO = [
+    "VALOR_OFERTA",
+    "VALOR FATURA",
+    "VALOR ZERADO",
+    "VALOR_ZERADO",
+    "PRE BILLING",
+    "PRE-BILLING",
+    "DIVERGENCIA_CONTRATO_PRODUTO",
+]
+
+# Regras NFCom/Impostos: TAG extraida da OBSERVACAO (formato "TAG_NAME: descricao")
+_REGRAS_TAG_OBS = ["VALIDACAO_NFCOM", "VALIDACAO_IMPOSTOS"]
+
+# Regras que usam a propria REGRA como TAG (fallback .otherwise — listadas aqui so para documentacao):
+#   GAP_FATURAMENTO, VALIDACAO_ENCARGOS_MULTA_JUROS, FATURAS_NAO_FATURAVEIS,
+#   ENDERECO_LEGAL, DADOS_CADASTRAIS, ENDERECO_INSTALACAO
+
+# Helper: extrai a TAG antes do primeiro ":" na OBSERVACAO
+_tag_from_obs = F.trim(F.split(F.col("OBSERVACAO"), ":").getItem(0))
 
 df_result = (
     df_com_tag
@@ -246,11 +283,18 @@ df_result = (
         # 18. GRUPO
         F.col("Grupo_Localidade").cast(StringType()).alias("GRUPO"),
 
-        # 19. STATUS_VALIDACAO — sempre PENDENTE (sao todos INCORRETO)
-        F.lit("PENDENTE").alias("STATUS_VALIDACAO"),
+        # 19. STATUS_VALIDACAO — INCORRETO e ALERTA → PENDENTE
+        F.when(F.col("STATUS").isin("INCORRETO", "ALERTA"), F.lit("PENDENTE"))
+         .otherwise(F.lit("VALIDADO"))
+         .alias("STATUS_VALIDACAO"),
 
-        # 20. TAG — VALOR_OFERTA/DIVERGENCIA/ZERADO → Produto, senao → REGRA
+        # 20. TAG — NFCOM/IMPOSTOS → extrai da OBSERVACAO (antes do ":")
+        #          regras de produto → nome do Produto
+        #          demais regras    → propria REGRA
         F.when(
+            F.col("REGRA").isin(_REGRAS_TAG_OBS),
+            F.coalesce(_tag_from_obs, F.col("REGRA"))
+        ).when(
             F.col("REGRA").isin(_REGRAS_TAG_PRODUTO),
             F.coalesce(F.col("Produto"), F.col("REGRA"))
         ).otherwise(F.col("REGRA"))
@@ -265,11 +309,24 @@ df_result = (
         # 23. CHAMADO — nulo
         _null.alias("CHAMADO"),
 
-        # 24. RESUMO — TAG | OBSERVACAO
-        F.concat(
-            F.when(F.col("REGRA").isin(_REGRAS_TAG_PRODUTO), F.coalesce(F.col("Produto"), F.col("REGRA"))).otherwise(F.col("REGRA")),
-            F.lit(" | "),
-            F.col("OBSERVACAO")
+        # 24. RESUMO — TAG | OBSERVACAO  (OBSERVACAO pode ser nula para regras sem detalhe)
+        F.when(
+            F.col("OBSERVACAO").isNotNull() & (F.trim(F.col("OBSERVACAO")) != ""),
+            F.concat(
+                F.when(F.col("REGRA").isin(_REGRAS_TAG_OBS),
+                       F.coalesce(_tag_from_obs, F.col("REGRA")))
+                 .when(F.col("REGRA").isin(_REGRAS_TAG_PRODUTO),
+                       F.coalesce(F.col("Produto"), F.col("REGRA")))
+                 .otherwise(F.col("REGRA")),
+                F.lit(" | "),
+                F.col("OBSERVACAO")
+            )
+        ).otherwise(
+            F.when(F.col("REGRA").isin(_REGRAS_TAG_OBS),
+                   F.coalesce(_tag_from_obs, F.col("REGRA")))
+             .when(F.col("REGRA").isin(_REGRAS_TAG_PRODUTO),
+                   F.coalesce(F.col("Produto"), F.col("REGRA")))
+             .otherwise(F.col("REGRA"))
         ).alias("RESUMO"),
 
         # 25. _FILTRA_PAGE_TAG — REGRA_STATUS
@@ -283,11 +340,17 @@ df_result = (
     )
 )
 
-# Remove duplicatas
-df_result = df_result.dropDuplicates()
+# Remove duplicatas pela chave de negocio
+# (exclui DATA_ABERTURA_CHAMADO/DT_EMISSAO que sao current_date e nao definem unicidade)
+_CHAVE_DEDUP = [
+    "FATURA", "ID_CONTA", "REGRA", "STATUS", "SUBSTATUS",
+    "OBSERVACAO", "PRODUTO", "TIPO_SERVICO", "DESCRICAO_SERVICO",
+    "TIPO_IMPOSTO", "PROMOCAO", "GRUPO", "ID_LOTE",
+]
+df_result = df_result.dropDuplicates(_CHAVE_DEDUP)
 
 cnt = df_result.count()
-print(f"Resultado: {cnt:,} linhas (somente com TAG)")
+print(f"[DIAG 3] Apos select+dedup por chave negocio: {cnt:,} linhas")
 
 # COMMAND ----------
 
@@ -341,20 +404,24 @@ LIMIT 5
 
 checks = []
 
-# 1. Somente INCORRETO
-c1 = spark.sql(f"SELECT COUNT(*) FROM {TBL_DESTINO} WHERE ID_LOTE='{CICLO_REF}' AND STATUS != 'INCORRETO'").collect()[0][0] == 0
+# 1. Somente INCORRETO ou ALERTA
+c1 = spark.sql(f"SELECT COUNT(*) FROM {TBL_DESTINO} WHERE ID_LOTE='{CICLO_REF}' AND STATUS NOT IN ('INCORRETO','ALERTA')").collect()[0][0] == 0
 checks.append(c1)
-print(f"1. Somente INCORRETO: {'✅' if c1 else '❌'}")
+print(f"1. Somente INCORRETO/ALERTA: {'✅' if c1 else '❌'}")
 
 # 2. TAG nunca nula
 c2 = spark.sql(f"SELECT COUNT(*) FROM {TBL_DESTINO} WHERE ID_LOTE='{CICLO_REF}' AND (TAG IS NULL OR TAG = '')").collect()[0][0] == 0
 checks.append(c2)
 print(f"2. TAG sempre preenchida: {'✅' if c2 else '❌'}")
 
-# 3. STATUS_VALIDACAO sempre PENDENTE
-c3 = spark.sql(f"SELECT COUNT(*) FROM {TBL_DESTINO} WHERE ID_LOTE='{CICLO_REF}' AND STATUS_VALIDACAO != 'PENDENTE'").collect()[0][0] == 0
+# 3. STATUS_VALIDACAO consistente (INCORRETO/ALERTA → PENDENTE)
+c3 = spark.sql(f"""
+    SELECT COUNT(*) FROM {TBL_DESTINO}
+    WHERE ID_LOTE='{CICLO_REF}'
+      AND STATUS IN ('INCORRETO','ALERTA') AND STATUS_VALIDACAO != 'PENDENTE'
+""").collect()[0][0] == 0
 checks.append(c3)
-print(f"3. STATUS_VALIDACAO=PENDENTE: {'✅' if c3 else '❌'}")
+print(f"3. STATUS_VALIDACAO=PENDENTE para INCORRETO/ALERTA: {'✅' if c3 else '❌'}")
 
 # 4. Schema 27 colunas
 cols_ref = ["FATURA","ID_CONTA","ASSET","REGRA","STATUS","SUBSTATUS","OBSERVACAO",
@@ -375,12 +442,71 @@ c5 = spark.sql(f"SELECT COUNT(*) FROM {TBL_DESTINO} WHERE ID_LOTE='{CICLO_REF}' 
 checks.append(c5)
 print(f"5. ANALISTA nulo: {'✅' if c5 else '❌'}")
 
-# 6. Contagem compativel com fonte INCORRETA
+# 6. Contagem compativel com fonte INCORRETO+ALERTA
 n_inc_fonte = df_com_tag.count()
 n_dst = spark.sql(f"SELECT COUNT(*) FROM {TBL_DESTINO} WHERE ID_LOTE='{CICLO_REF}'").collect()[0][0]
 c6 = n_inc_fonte == n_dst
 checks.append(c6)
-print(f"6. Contagem: fonte_incorreta={n_inc_fonte:,} vs destino={n_dst:,} {'✅' if c6 else '❌'}")
+print(f"6. Contagem: fonte_INCORRETO/ALERTA={n_inc_fonte:,} vs destino={n_dst:,} {'✅' if c6 else '❌'}")
 
 print(f"\n{'='*60}")
 print(f"{'✅ CARGA OK' if all(checks) else '⚠️ VER ISSUES'}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 9. Correcao retroativa de TAG — regras que usam REGRA como TAG
+# MAGIC
+# MAGIC Registros carregados antes da padronizacao da lista `_REGRAS_TAG_PRODUTO` podem ter
+# MAGIC TAG = nome do produto em vez do nome da regra. Este bloco corrige **toda a tabela**
+# MAGIC (todos os lotes) para as regras que devem usar a propria REGRA como TAG.
+
+# COMMAND ----------
+
+# Regras que devem ter TAG = REGRA (mesmo nome da regra), nao nome do produto
+_REGRAS_TAG_IGUAL_REGRA = [
+    "GAP_FATURAMENTO",
+    "ENDERECO_INSTALACAO",
+    "ENDERECO_LEGAL",
+    "DADOS_CADASTRAIS",
+    "FATURAS_NAO_FATURAVEIS",
+    "VALIDACAO_ENCARGOS_MULTA_JUROS",
+]
+
+_lista_sql = ", ".join(f"'{r}'" for r in _REGRAS_TAG_IGUAL_REGRA)
+
+# Contagem antes
+n_erradas = spark.sql(f"""
+    SELECT COUNT(*) FROM {TBL_DESTINO}
+    WHERE REGRA IN ({_lista_sql})
+      AND STATUS IN ('INCORRETO', 'ALERTA')
+      AND (TAG != REGRA OR TAG IS NULL)
+""").collect()[0][0]
+print(f"[RETRO] Registros com TAG incorreta antes da correcao: {n_erradas:,}")
+
+if n_erradas > 0:
+    spark.sql(f"""
+        UPDATE {TBL_DESTINO}
+        SET
+            TAG    = REGRA,
+            RESUMO = CASE
+                         WHEN OBSERVACAO IS NOT NULL AND TRIM(OBSERVACAO) != ''
+                         THEN CONCAT(REGRA, ' | ', OBSERVACAO)
+                         ELSE REGRA
+                     END
+        WHERE REGRA IN ({_lista_sql})
+          AND STATUS IN ('INCORRETO', 'ALERTA')
+          AND (TAG != REGRA OR TAG IS NULL)
+    """)
+    print(f"[RETRO] {n_erradas:,} registros corrigidos (TAG = REGRA) em {TBL_DESTINO}")
+else:
+    print("[RETRO] Nenhum registro com TAG incorreta — tabela ja consistente ✅")
+
+# Verificacao pos-correcao
+n_restantes = spark.sql(f"""
+    SELECT COUNT(*) FROM {TBL_DESTINO}
+    WHERE REGRA IN ({_lista_sql})
+      AND STATUS IN ('INCORRETO', 'ALERTA')
+      AND (TAG != REGRA OR TAG IS NULL)
+""").collect()[0][0]
+print(f"[RETRO] Registros com TAG incorreta apos correcao: {n_restantes:,} {'✅' if n_restantes == 0 else '❌'}")

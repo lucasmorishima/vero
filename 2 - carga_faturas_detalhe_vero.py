@@ -103,33 +103,43 @@ print(f"[DIAG 1] Fonte bruta (ID_Lote='{CICLO_REF}'): {cnt_fonte:,}")
 print("[DIAG 2] ID_Lote distintos na fonte:")
 df_fonte.groupBy("ID_Lote").count().orderBy("ID_Lote").show(truncate=False)
 
-# Distribuicao de REGRA na fonte — confirma que NFCOM/IMPOSTOS existem
+# Distribuicao de REGRA na fonte — confirma quais regras existem no ciclo
 print("[DIAG 3] REGRAs na fonte:")
 df_fonte.groupBy("REGRA").count().orderBy("REGRA").show(truncate=False)
+
+# Diagnostico especifico ENCARGOS
+_enc = df_fonte.filter(F.col("REGRA") == "VALIDACAO_ENCARGOS_MULTA_JUROS")
+print(f"[DIAG 3b] VALIDACAO_ENCARGOS_MULTA_JUROS na fonte: {_enc.count():,} linhas")
+if _enc.count() > 0:
+    _enc.groupBy("REGRA", "STATUS", "ID_Lote").count().show(truncate=False)
 
 if cnt_fonte == 0:
     raise Exception(f"STOP: fonte vazia para ID_Lote='{CICLO_REF}' — verifique o ciclo")
 
 # Filtro: somente contas que existem na principal (INCORRETAS)
-# EXCECAO: VALIDACAO_NFCOM e VALIDACAO_IMPOSTOS carregam integralmente —
-# essas regras nao passam pela principal pois sao geradas por pipeline proprio
+# EXCECAO: VALIDACAO_NFCOM, VALIDACAO_IMPOSTOS e VALIDACAO_ENCARGOS_MULTA_JUROS
+# carregam integralmente — geradas por pipelines proprios, nao passam pela principal.
 TBL_PRINCIPAL = "accenture.faturas_principal_vero"
-# faturas_principal_vero nao tem coluna CRM (tem ASSET = CRM concatenado).
-# O filtro so precisa verificar se a conta existe na principal — join por ID_CONTA basta.
+# Principal e tabela de estado corrente (full DELETE + reload a cada ciclo):
+# le sem filtro de lote — sempre reflete o ciclo mais recente carregado.
 df_principal = spark.table(TBL_PRINCIPAL).select(
     F.col("ID_CONTA").cast(StringType()).alias("_p_cta")
 ).dropDuplicates(["_p_cta"])
 
-_REGRAS_DIRETAS = ["VALIDACAO_NFCOM", "VALIDACAO_IMPOSTOS"]
+_REGRAS_DIRETAS = ["VALIDACAO_NFCOM", "VALIDACAO_IMPOSTOS", "VALIDACAO_ENCARGOS_MULTA_JUROS"]
 
-# Split: NFCOM/IMPOSTOS passam direto; demais filtradas pela principal
+# Split: regras diretas passam sem join; demais filtradas pelo principal
 df_diretas = df_fonte.filter(F.col("REGRA").isin(_REGRAS_DIRETAS))
 df_outras   = df_fonte.filter(~F.col("REGRA").isin(_REGRAS_DIRETAS))
 
 cnt_diretas_pre = df_diretas.count()
-print(f"[DIAG 4] NFCOM/IMPOSTOS antes do union: {cnt_diretas_pre:,}")
-print("[DIAG 5] NFCOM/IMPOSTOS por REGRA+STATUS:")
+print(f"[DIAG 4] Diretas (NFCOM/IMPOSTOS/ENCARGOS) antes do union: {cnt_diretas_pre:,}")
+print("[DIAG 5] Diretas por REGRA+STATUS:")
 df_diretas.groupBy("REGRA","STATUS").count().orderBy("REGRA","STATUS").show(truncate=False)
+
+# Breakdown das diretas por REGRA — mostra se ENCARGOS tem dados na fonte
+print("[DIAG 5b] Breakdown das diretas por REGRA+STATUS:")
+df_diretas.groupBy("REGRA", "STATUS").count().orderBy("REGRA", "STATUS").show(truncate=False)
 
 df_outras = (
     df_outras
@@ -198,19 +208,23 @@ def _norm_crm(col):
          .otherwise(F.coalesce(F.trim(col), F.lit("NAO_IDENTIFICADO")))
     )
 
-# Regras que usam Produto como TAG
-_REGRAS_TAG_PRODUTO = ["ENDERECO_INSTALACAO",
-"VALOR FATURA",
-"DIVERGENCIA_CONTRATO_PRODUTO",
-"VALOR ZERADO",
-"ENDERECO_LEGAL",
-"GAP_FATURAMENTO",
-"PRE BILLING",
-"DADOS_CADASTRAIS",
-"FATURAS_NAO_FATURAVEIS"]
+# Regras que usam o nome do Produto como TAG
+_REGRAS_TAG_PRODUTO = [
+    "VALOR_OFERTA",
+    "VALOR FATURA",
+    "VALOR ZERADO",
+    "VALOR_ZERADO",
+    "PRE BILLING",
+    "PRE-BILLING",
+    "DIVERGENCIA_CONTRATO_PRODUTO",
+]
 
 # Regras NFCom/Impostos: TAG extraida da OBSERVACAO (formato "TAG_NAME: descricao")
 _REGRAS_TAG_OBS = ["VALIDACAO_NFCOM", "VALIDACAO_IMPOSTOS"]
+
+# Regras que usam a propria REGRA como TAG (fallback .otherwise — listadas aqui so para documentacao):
+#   GAP_FATURAMENTO, VALIDACAO_ENCARGOS_MULTA_JUROS, FATURAS_NAO_FATURAVEIS,
+#   ENDERECO_LEGAL, DADOS_CADASTRAIS, ENDERECO_INSTALACAO
 
 # Helper: extrai a TAG antes do primeiro ":" na OBSERVACAO
 # Ex: "CFOP_INVALIDO: CFOP fora da lista..." → "CFOP_INVALIDO"
@@ -383,11 +397,17 @@ df_result = (
     )
 )
 
-# Remove duplicatas
-df_result = df_result.dropDuplicates()
+# Remove duplicatas pela chave de negocio
+# (exclui DATA_ABERTURA_CHAMADO/DT_EMISSAO que sao current_date e nao definem unicidade)
+_CHAVE_DEDUP = [
+    "FATURA", "ID_CONTA", "REGRA", "STATUS", "SUBSTATUS",
+    "OBSERVACAO", "PRODUTO", "TIPO_SERVICO", "DESCRICAO_SERVICO",
+    "TIPO_IMPOSTO", "PROMOCAO", "GRUPO", "ID_LOTE",
+]
+df_result = df_result.dropDuplicates(_CHAVE_DEDUP)
 
 cnt = df_result.count()
-print(f"[DIAG 7] Apos select+dedup: {cnt:,} linhas")
+print(f"[DIAG 7] Apos select+dedup por chave negocio: {cnt:,} linhas")
 print("[DIAG 8] NFCOM/IMPOSTOS no resultado apos select+dedup:")
 df_result.filter(F.col("REGRA").isin("VALIDACAO_NFCOM","VALIDACAO_IMPOSTOS")) \
     .groupBy("REGRA","STATUS","SUBSTATUS").count().orderBy("REGRA","STATUS").show(truncate=False)
@@ -520,3 +540,62 @@ print(f"5. _FILTRA_PAGE preenchido: {'✅' if c5 else '❌'}")
 
 print(f"\n{'='*60}")
 print(f"{'✅ CARGA OK' if all(checks) else '⚠️ VER ISSUES'}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 9. Correcao retroativa de TAG — regras que usam REGRA como TAG
+# MAGIC
+# MAGIC Registros carregados antes da padronizacao da lista `_REGRAS_TAG_PRODUTO` podem ter
+# MAGIC TAG = nome do produto em vez do nome da regra. Este bloco corrige **toda a tabela**
+# MAGIC (todos os lotes) para as regras que devem usar a propria REGRA como TAG.
+
+# COMMAND ----------
+
+# Regras que devem ter TAG = REGRA (mesmo nome da regra), nao nome do produto
+_REGRAS_TAG_IGUAL_REGRA = [
+    "GAP_FATURAMENTO",
+    "ENDERECO_INSTALACAO",
+    "ENDERECO_LEGAL",
+    "DADOS_CADASTRAIS",
+    "FATURAS_NAO_FATURAVEIS",
+    "VALIDACAO_ENCARGOS_MULTA_JUROS",
+]
+
+_lista_sql = ", ".join(f"'{r}'" for r in _REGRAS_TAG_IGUAL_REGRA)
+
+# Contagem antes
+n_erradas = spark.sql(f"""
+    SELECT COUNT(*) FROM {TBL_DESTINO}
+    WHERE REGRA IN ({_lista_sql})
+      AND STATUS IN ('INCORRETO', 'ALERTA')
+      AND (TAG != REGRA OR TAG IS NULL)
+""").collect()[0][0]
+print(f"[RETRO] Registros com TAG incorreta antes da correcao: {n_erradas:,}")
+
+if n_erradas > 0:
+    spark.sql(f"""
+        UPDATE {TBL_DESTINO}
+        SET
+            TAG    = REGRA,
+            RESUMO = CASE
+                         WHEN OBSERVACAO IS NOT NULL AND TRIM(OBSERVACAO) != ''
+                         THEN CONCAT(REGRA, ' | ', OBSERVACAO)
+                         ELSE REGRA
+                     END
+        WHERE REGRA IN ({_lista_sql})
+          AND STATUS IN ('INCORRETO', 'ALERTA')
+          AND (TAG != REGRA OR TAG IS NULL)
+    """)
+    print(f"[RETRO] {n_erradas:,} registros corrigidos (TAG = REGRA) em {TBL_DESTINO}")
+else:
+    print("[RETRO] Nenhum registro com TAG incorreta — tabela ja consistente ✅")
+
+# Verificacao pos-correcao
+n_restantes = spark.sql(f"""
+    SELECT COUNT(*) FROM {TBL_DESTINO}
+    WHERE REGRA IN ({_lista_sql})
+      AND STATUS IN ('INCORRETO', 'ALERTA')
+      AND (TAG != REGRA OR TAG IS NULL)
+""").collect()[0][0]
+print(f"[RETRO] Registros com TAG incorreta apos correcao: {n_restantes:,} {'✅' if n_restantes == 0 else '❌'}")

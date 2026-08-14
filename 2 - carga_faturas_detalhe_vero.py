@@ -6,7 +6,7 @@
 # MAGIC
 # MAGIC ### Logica
 # MAGIC - Cada linha da fonte gera exatamente 1 linha no destino
-# MAGIC - Schema identico a `detalhes_da_fatura_v4` (28 colunas)
+# MAGIC - Schema v2: 23 colunas (SISTEMA, SEGMENTO, POSSUI_PREBILLING)
 # MAGIC - Campos mapeados direto, campos incrementais auto, campos sem origem = nulo
 
 # COMMAND ----------
@@ -50,7 +50,7 @@ spark.sql(f"""
 CREATE TABLE IF NOT EXISTS {TBL_DESTINO} (
     FATURA                          STRING,
     ID_CONTA                        STRING,
-    ASSET                           STRING,
+    SISTEMA                         STRING,
     REGRA                           STRING,
     STATUS                          STRING,
     SUBSTATUS                       STRING,
@@ -58,18 +58,13 @@ CREATE TABLE IF NOT EXISTS {TBL_DESTINO} (
     DADOS_KENAN                     STRING,
     DADOS_TABELA_VERDADE            STRING,
     ID_LOTE                         STRING,
-    PRODUTO                         STRING,
-    COMPONENT_ID                    STRING,
+    SEGMENTO                        STRING,
+    POSSUI_PREBILLING               STRING,
     TIPO_SERVICO                    STRING,
-    ID_SERVICO                      STRING,
     DESCRICAO_SERVICO               STRING,
     TIPO_IMPOSTO                    STRING,
-    PROMOCAO                        STRING,
-    GRUPO                           STRING,
     STATUS_VALIDACAO                STRING,
     TAG                             STRING,
-    STATUS_RETORNO                  STRING,
-    CHAMADO                         STRING,
     RESUMO                          STRING,
     _Ordem_Status_DET               INT,
     _Prioridade_Final_da_Fatura     INT,
@@ -79,11 +74,14 @@ CREATE TABLE IF NOT EXISTS {TBL_DESTINO} (
 )
 USING DELTA
 TBLPROPERTIES (
+    'delta.columnMapping.mode'        = 'name',
+    'delta.minReaderVersion'          = '2',
+    'delta.minWriterVersion'          = '5',
     'delta.autoOptimize.optimizeWrite' = 'true',
     'delta.autoOptimize.autoCompact'   = 'true'
 )
 """)
-print(f"DDL {TBL_DESTINO} OK — 28 colunas identicas a detalhes_da_fatura_v4")
+print(f"DDL {TBL_DESTINO} OK — 22 colunas (schema v2)")
 
 # COMMAND ----------
 
@@ -161,13 +159,13 @@ print(f"[DIAG 6] Apos union — NFCOM/IMPOSTOS: {cnt_diretas_pre:,} | Outras: {c
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 5. Mapeamento 1:1 — 28 colunas
+# MAGIC ## 5. Mapeamento 1:1 — 23 colunas (schema v2)
 # MAGIC
 # MAGIC | # | Destino                       | Fonte                         | Logica                                  |
 # MAGIC |---|-------------------------------|-------------------------------|-----------------------------------------|
 # MAGIC | 1 | FATURA                        | FATURA                        | direto (string)                         |
 # MAGIC | 2 | ID_CONTA                      | ID_CONTA_CONTRATO             | direto (string)                         |
-# MAGIC | 3 | ASSET                         | CRM                           | sistema origem                          |
+# MAGIC | 3 | SISTEMA                       | CRM                           | sistema origem                          |
 # MAGIC | 4 | REGRA                         | REGRA                         | direto                                  |
 # MAGIC | 5 | STATUS                        | STATUS                        | direto                                  |
 # MAGIC | 6 | SUBSTATUS                     | SUBSTATUS                     | direto                                  |
@@ -175,31 +173,26 @@ print(f"[DIAG 6] Apos union — NFCOM/IMPOSTOS: {cnt_diretas_pre:,} | Outras: {c
 # MAGIC | 8 | DADOS_KENAN                   | DADOS_BILLING                 | renomear                                |
 # MAGIC | 9 | DADOS_TABELA_VERDADE          | DADOS_TABELA_VERDADE          | direto                                  |
 # MAGIC |10 | ID_LOTE                       | ID_Lote                       | direto                                  |
-# MAGIC |11 | PRODUTO                       | SEGMENTO                      | B2C/B2B                                 |
-# MAGIC |12 | COMPONENT_ID                  | —                             | nulo                                    |
+# MAGIC |11 | SEGMENTO                      | SEGMENTO                      | B2C/B2B (coalesce NAO IDENTIFICADO)     |
+# MAGIC |12 | POSSUI_PREBILLING             | REGRA (qualquer status)       | SIM se contrato tem PRE BILLING/PRE-BILLING |
 # MAGIC |13 | TIPO_SERVICO                  | Tipo_Servico                  | direto                                  |
-# MAGIC |14 | ID_SERVICO                    | —                             | nulo                                    |
-# MAGIC |15 | DESCRICAO_SERVICO             | Desc_Servico                  | direto                                  |
-# MAGIC |16 | TIPO_IMPOSTO                  | Tipo_Imposto                  | direto                                  |
-# MAGIC |17 | PROMOCAO                      | Promocao                      | direto                                  |
-# MAGIC |18 | GRUPO                         | Grupo_Localidade              | direto                                  |
-# MAGIC |19 | STATUS_VALIDACAO              | —                             | PENDENTE se INCORRETO, VALIDADO se nao  |
-# MAGIC |20 | TAG                           | —                             | extraido da OBSERVACAO (antes do :)     |
-# MAGIC |21 | STATUS_RETORNO                | —                             | nulo                                    |
-# MAGIC |22 | CHAMADO                       | —                             | nulo                                    |
-# MAGIC |23 | RESUMO                        | —                             | REGRA + OBSERVACAO                      |
-# MAGIC |24 | _Ordem_Status_DET             | —                             | 3=INCORRETO, 1=CORRETO                  |
-# MAGIC |25 | _Prioridade_Final_da_Fatura   | —                             | 4=INCORRETO, 1=CORRETO                  |
-# MAGIC |26 | _FILTRA_PAGE                  | —                             | REGRA_STATUS                            |
-# MAGIC |27 | DATA_ABERTURA_CHAMADO         | —                             | current_date                            |
-# MAGIC |28 | DT_EMISSAO                    | —                             | current_date                            |
+# MAGIC |14 | DESCRICAO_SERVICO             | Desc_Servico                  | direto                                  |
+# MAGIC |15 | TIPO_IMPOSTO                  | Tipo_Imposto                  | direto                                  |
+# MAGIC |16 | STATUS_VALIDACAO              | —                             | PENDENTE se INCORRETO, VALIDADO se nao  |
+# MAGIC |17 | TAG                           | —                             | extraido da OBSERVACAO (antes do :)     |
+# MAGIC |18 | RESUMO                        | —                             | REGRA + OBSERVACAO                      |
+# MAGIC |19 | _Ordem_Status_DET             | —                             | 3=INCORRETO, 1=CORRETO                  |
+# MAGIC |20 | _Prioridade_Final_da_Fatura   | —                             | 4=INCORRETO, 1=CORRETO                  |
+# MAGIC |21 | _FILTRA_PAGE                  | —                             | REGRA_STATUS                            |
+# MAGIC |22 | DATA_ABERTURA_CHAMADO         | —                             | current_date                            |
+# MAGIC |23 | DT_EMISSAO                    | —                             | current_date                            |
 
 # COMMAND ----------
 
 _null = F.lit(None).cast(StringType())
 
 # ---------------------------------------------------------------------------
-# Normalizacao do sistema (CRM → ASSET)
+# Normalizacao do sistema (CRM → SISTEMA)
 # SIMETRA(AN) e AN sao o mesmo sistema — padronizar para SIMETRA
 # ---------------------------------------------------------------------------
 def _norm_crm(col):
@@ -230,6 +223,30 @@ _REGRAS_TAG_OBS = ["VALIDACAO_NFCOM", "VALIDACAO_IMPOSTOS"]
 # Ex: "CFOP_INVALIDO: CFOP fora da lista..." → "CFOP_INVALIDO"
 _tag_from_obs = F.trim(F.split(F.col("OBSERVACAO"), ":").getItem(0))
 
+# ---------------------------------------------------------------------------
+# POSSUI_PREBILLING: verifica se o contrato possui a regra PRE BILLING
+# em qualquer linha do ciclo (qualquer status), entao propaga para todas
+# as linhas do mesmo contrato via broadcast join.
+# ---------------------------------------------------------------------------
+_pb_accts = (
+    df_fonte
+    .filter(F.upper(F.trim(F.col("REGRA"))).isin("PRE-BILLING", "PRE BILLING"))
+    .select(F.col("ID_CONTA_CONTRATO").cast(StringType()).alias("_pb_cta"))
+    .distinct()
+)
+df_fonte = (
+    df_fonte
+    .join(
+        F.broadcast(_pb_accts),
+        df_fonte["ID_CONTA_CONTRATO"].cast(StringType()) == _pb_accts["_pb_cta"],
+        how="left"
+    )
+    .withColumn("_possui_pb",
+        F.when(F.col("_pb_cta").isNotNull(), F.lit("SIM")).otherwise(F.lit("NAO"))
+    )
+    .drop("_pb_cta")
+)
+
 df_result = (
     df_fonte
     .select(
@@ -239,8 +256,8 @@ df_result = (
         # 2. ID_CONTA
         F.col("ID_CONTA_CONTRATO").cast(StringType()).alias("ID_CONTA"),
 
-        # 3. ASSET (sistema origem — normalizado: AN / SIMETRA(AN) → SIMETRA)
-        _norm_crm(F.col("CRM")).alias("ASSET"),
+        # 3. SISTEMA (sistema origem — normalizado: AN / SIMETRA(AN) → SIMETRA)
+        _norm_crm(F.col("CRM")).alias("SISTEMA"),
 
         # 4. REGRA
         F.col("REGRA").cast(StringType()).alias("REGRA"),
@@ -299,31 +316,22 @@ df_result = (
         # 10. ID_LOTE
         F.col("ID_Lote").cast(StringType()).alias("ID_LOTE"),
 
-        # 11. PRODUTO (= SEGMENTO)
-        F.coalesce(F.col("SEGMENTO"), F.lit("NAO IDENTIFICADO")).alias("PRODUTO"),
+        # 11. SEGMENTO (origem: coluna SEGMENTO da fonte = B2C/B2B/etc.)
+        F.coalesce(F.col("SEGMENTO"), F.lit("NAO IDENTIFICADO")).alias("SEGMENTO"),
 
-        # 12. COMPONENT_ID — nulo
-        _null.alias("COMPONENT_ID"),
+        # 12. POSSUI_PREBILLING — SIM se o contrato tem PRE BILLING em qualquer linha do ciclo
+        F.col("_possui_pb").alias("POSSUI_PREBILLING"),
 
         # 13. TIPO_SERVICO
         F.col("Tipo_Servico").cast(StringType()).alias("TIPO_SERVICO"),
 
-        # 14. ID_SERVICO — nulo
-        _null.alias("ID_SERVICO"),
-
-        # 15. DESCRICAO_SERVICO
+        # 13. DESCRICAO_SERVICO
         F.col("Desc_Servico").cast(StringType()).alias("DESCRICAO_SERVICO"),
 
-        # 16. TIPO_IMPOSTO
+        # 14. TIPO_IMPOSTO
         F.col("Tipo_Imposto").cast(StringType()).alias("TIPO_IMPOSTO"),
 
-        # 17. PROMOCAO
-        F.col("Promocao").cast(StringType()).alias("PROMOCAO"),
-
-        # 18. GRUPO
-        F.col("Grupo_Localidade").cast(StringType()).alias("GRUPO"),
-
-        # 19. STATUS_VALIDACAO
+        # 15. STATUS_VALIDACAO
         #     INCORRETO → PENDENTE | ALERTA → PENDENTE | CORRETO → VALIDADO
         F.when(F.col("STATUS").isin("INCORRETO", "ALERTA"), F.lit("PENDENTE"))
          .otherwise(F.lit("VALIDADO"))
@@ -344,13 +352,7 @@ df_result = (
         ).otherwise(_null)
          .alias("TAG"),
 
-        # 21. STATUS_RETORNO — nulo
-        _null.alias("STATUS_RETORNO"),
-
-        # 22. CHAMADO — nulo
-        _null.alias("CHAMADO"),
-
-        # 23. RESUMO — TAG | OBSERVACAO
+        # 17. RESUMO — TAG | OBSERVACAO
         #     TAG calculada igual à coluna 20 (NFCOM/IMPOSTOS → obs, Produto → produto, resto → regra)
         F.when(
             F.col("OBSERVACAO").isNotNull() & (F.trim(F.col("OBSERVACAO")) != ""),
@@ -401,8 +403,8 @@ df_result = (
 # (exclui DATA_ABERTURA_CHAMADO/DT_EMISSAO que sao current_date e nao definem unicidade)
 _CHAVE_DEDUP = [
     "FATURA", "ID_CONTA", "REGRA", "STATUS", "SUBSTATUS",
-    "OBSERVACAO", "PRODUTO", "TIPO_SERVICO", "DESCRICAO_SERVICO",
-    "TIPO_IMPOSTO", "PROMOCAO", "GRUPO", "ID_LOTE",
+    "OBSERVACAO", "SEGMENTO", "TIPO_SERVICO", "DESCRICAO_SERVICO",
+    "TIPO_IMPOSTO", "ID_LOTE",
 ]
 df_result = df_result.dropDuplicates(_CHAVE_DEDUP)
 
@@ -462,7 +464,7 @@ ORDER BY REGRA, STATUS
 
 # Amostra incorretas
 spark.sql(f"""
-SELECT FATURA, ID_CONTA, ASSET, REGRA, STATUS, SUBSTATUS,
+SELECT FATURA, ID_CONTA, SISTEMA, SEGMENTO, REGRA, STATUS, SUBSTATUS,
     OBSERVACAO, TAG, RESUMO, _FILTRA_PAGE
 FROM {TBL_DESTINO}
 WHERE ID_LOTE = '{CICLO_REF}' AND STATUS = 'INCORRETO'
@@ -473,7 +475,7 @@ LIMIT 5
 
 # Amostra corretas
 spark.sql(f"""
-SELECT FATURA, ID_CONTA, ASSET, REGRA, STATUS, SUBSTATUS,
+SELECT FATURA, ID_CONTA, SISTEMA, SEGMENTO, REGRA, STATUS, SUBSTATUS,
     STATUS_VALIDACAO, _Ordem_Status_DET, _FILTRA_PAGE
 FROM {TBL_DESTINO}
 WHERE ID_LOTE = '{CICLO_REF}' AND STATUS = 'CORRETO'
@@ -496,17 +498,20 @@ c1 = n_src == n_dst
 checks.append(c1)
 print(f"1. Espelho 1:1: fonte={n_src:,} vs destino={n_dst:,} {'✅' if c1 else '❌'}")
 
-# 2. Schema 28 colunas
-cols_ref = ["FATURA","ID_CONTA","ASSET","REGRA","STATUS","SUBSTATUS","OBSERVACAO",
-            "DADOS_KENAN","DADOS_TABELA_VERDADE","ID_LOTE","PRODUTO","COMPONENT_ID",
-            "TIPO_SERVICO","ID_SERVICO","DESCRICAO_SERVICO","TIPO_IMPOSTO","PROMOCAO",
-            "GRUPO","STATUS_VALIDACAO","TAG","STATUS_RETORNO","CHAMADO","RESUMO",
+# 2. Schema 23 colunas (v2)
+cols_ref = ["FATURA","ID_CONTA","SISTEMA","REGRA","STATUS","SUBSTATUS","OBSERVACAO",
+            "DADOS_KENAN","DADOS_TABELA_VERDADE","ID_LOTE","SEGMENTO","POSSUI_PREBILLING",
+            "TIPO_SERVICO","DESCRICAO_SERVICO","TIPO_IMPOSTO",
+            "STATUS_VALIDACAO","TAG","RESUMO",
             "_Ordem_Status_DET","_Prioridade_Final_da_Fatura","_FILTRA_PAGE",
             "DATA_ABERTURA_CHAMADO","DT_EMISSAO"]
 cols_dst = [c.name for c in spark.table(TBL_DESTINO).schema.fields]
-c2 = cols_dst == cols_ref
+c2 = set(cols_ref).issubset(set(cols_dst))
 checks.append(c2)
-print(f"2. Schema 28 colunas: {'✅' if c2 else '❌'}")
+print(f"2. Schema 23 colunas (v2): {'✅' if c2 else '❌'}")
+if not c2:
+    faltando = set(cols_ref) - set(cols_dst)
+    if faltando: print(f"   Faltando: {faltando}")
 if not c2:
     print(f"   Esperado: {cols_ref}")
     print(f"   Obtido:   {cols_dst}")

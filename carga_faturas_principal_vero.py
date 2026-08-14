@@ -58,7 +58,9 @@ CREATE TABLE IF NOT EXISTS {TBL_DESTINO} (
     ID_CONTA                STRING,
     NOME_CLIENTE            STRING,
     CPF_CNPJ                STRING,
-    ASSET                   STRING,
+    SISTEMA                 STRING,
+    SEGMENTO                STRING,
+    POSSUI_PREBILLING       STRING,
     STATUS                  STRING,
     STATUS_VALIDACAO        STRING,
     ANALISTA                STRING,
@@ -66,8 +68,6 @@ CREATE TABLE IF NOT EXISTS {TBL_DESTINO} (
     PROBLEMA                STRING,
     VALOR                   DOUBLE,
     CRIADO_EM               STRING,
-    STATUS_RETORNO          STRING,
-    CHAMADO                 STRING,
     RESUMO                  STRING,
     Ordem_Status            INT,
     DATA_ABERTURA_CHAMADO   DATE,
@@ -77,16 +77,19 @@ CREATE TABLE IF NOT EXISTS {TBL_DESTINO} (
 )
 USING DELTA
 TBLPROPERTIES (
+    'delta.columnMapping.mode'         = 'name',
+    'delta.minReaderVersion'           = '2',
+    'delta.minWriterVersion'           = '5',
     'delta.autoOptimize.optimizeWrite' = 'true',
     'delta.autoOptimize.autoCompact'   = 'true'
 )
 """)
-for _col_ddl in ["ASSET STRING", "NOME_CLIENTE STRING", "CPF_CNPJ STRING", "ID_LOTE STRING"]:
+for _col_ddl in ["SISTEMA STRING", "SEGMENTO STRING", "POSSUI_PREBILLING STRING", "NOME_CLIENTE STRING", "CPF_CNPJ STRING", "ID_LOTE STRING"]:
     try:
         spark.sql(f"ALTER TABLE {TBL_DESTINO} ADD COLUMNS ({_col_ddl})")
     except Exception:
         pass  # coluna ja existe
-print(f"DDL {TBL_DESTINO} OK — 20 colunas")
+print(f"DDL {TBL_DESTINO} OK — 19 colunas (schema v2)")
 
 # COMMAND ----------
 
@@ -159,13 +162,12 @@ print(f"Clientes por IDCONTA: {df_cli_conta.count():,} | por IDCONTRATO: {df_cli
 # MAGIC | 7 | PROBLEMA             | Concatenacao de REGRA das linhas INCORRETAS (pipe-separated)  |
 # MAGIC | 8 | VALOR                | SUM(VALOR_BILLING), 0 se nulo                                |
 # MAGIC | 9 | CRIADO_EM            | current_timestamp (string ISO)                                |
-# MAGIC |10 | STATUS_RETORNO       | null                                                         |
-# MAGIC |11 | CHAMADO              | null                                                         |
-# MAGIC |12 | RESUMO               | Concatenacao TAG: obs | SEVERIDADE: substatus                 |
-# MAGIC |13 | Ordem_Status         | soma ponderada regras distintas incorretas (PRE-BILLING=2, demais=1) |
-# MAGIC |14 | DATA_ABERTURA_CHAMADO| current_date                                                  |
-# MAGIC |15 | DT_EMISSAO           | MIN(DT_EMISSAO) do grupo — ou current_date se nulo           |
-# MAGIC |16 | Valor_Positive       | SIM se VALOR > 0, NAO caso contrario                         |
+# MAGIC |10 | RESUMO               | Concatenacao TAG: obs | SEVERIDADE: substatus                 |
+# MAGIC |11 | Ordem_Status         | soma ponderada regras distintas incorretas (PRE-BILLING=2, demais=1) |
+# MAGIC |12 | DATA_ABERTURA_CHAMADO| current_date                                                  |
+# MAGIC |13 | DT_EMISSAO           | MIN(DT_EMISSAO) do grupo — ou current_date se nulo           |
+# MAGIC |14 | Valor_Positive       | SIM se VALOR > 0, NAO caso contrario                         |
+# MAGIC |15 | ID_LOTE              | CICLO_REF (ano-mes)                                           |
 
 # COMMAND ----------
 
@@ -175,8 +177,9 @@ print(f"Clientes por IDCONTA: {df_cli_conta.count():,} | por IDCONTRATO: {df_cli
 
 # Colunas opcionais — podem nao existir em versoes antigas da fonte
 _cols_fonte  = df_fonte.columns
-_produto_col = F.col("Produto") if "Produto" in _cols_fonte else F.lit(None).cast(StringType())
-print(f"[INFO] CRM na fonte: {'sim' if 'CRM' in _cols_fonte else 'nao'}  |  Produto: {'sim' if 'Produto' in _cols_fonte else 'nao'}")
+_produto_col  = F.col("Produto")   if "Produto"   in _cols_fonte else F.lit(None).cast(StringType())
+_segmento_col = F.col("SEGMENTO")  if "SEGMENTO"  in _cols_fonte else F.lit("NAO IDENTIFICADO").cast(StringType())
+print(f"[INFO] CRM na fonte: {'sim' if 'CRM' in _cols_fonte else 'nao'}  |  Produto: {'sim' if 'Produto' in _cols_fonte else 'nao'}  |  SEGMENTO: {'sim' if 'SEGMENTO' in _cols_fonte else 'nao'}")
 
 # ── listas de TAG alinhadas com carga_detalhes ──────────────────────────────
 # Regras NFCom/Impostos: TAG extraida da OBSERVACAO (formato "NOME_TAG: descricao")
@@ -278,6 +281,15 @@ df_agg = (
         # max() garante valor único e determinístico, nunca concatena
         F.max(F.col("_crm_norm")).alias("_SISTEMAS"),
 
+        # Segmento da conta (B2B / B2C) — capturado da tabela de origem
+        F.max(F.coalesce(_segmento_col, F.lit("NAO IDENTIFICADO"))).alias("_SEGMENTO"),
+
+        # POSSUI_PREBILLING: SIM se o contrato tem PRE BILLING em qualquer linha do ciclo
+        F.max(
+            F.when(F.upper(F.trim(F.col("REGRA"))).isin("PRE-BILLING", "PRE BILLING"), F.lit(1))
+             .otherwise(F.lit(0))
+        ).alias("_possui_pb"),
+
         # Flag: tem regra PRE-BILLING incorreta? (para campo ANALISTA)
         F.max(
             F.when(
@@ -330,10 +342,17 @@ df_result = (
         # 2. ID_CONTA (STRING)
         F.col("ID_CONTA_CONTRATO").cast(StringType()).alias("ID_CONTA"),
 
-        # 3. ASSET — sistemas (CRM) distintos da conta
-        F.col("_SISTEMAS").cast(StringType()).alias("ASSET"),
+        # 3. SISTEMA — sistemas (CRM) distintos da conta
+        F.col("_SISTEMAS").cast(StringType()).alias("SISTEMA"),
 
-        # 5. STATUS — alinhado com detalhe: INCORRETO > ALERTA > CORRETO
+        # 4. SEGMENTO — B2B / B2C
+        F.col("_SEGMENTO").cast(StringType()).alias("SEGMENTO"),
+
+        # 5. POSSUI_PREBILLING — SIM se o contrato tem PRE BILLING em qualquer linha do ciclo
+        F.when(F.col("_possui_pb") == 1, F.lit("SIM")).otherwise(F.lit("NAO"))
+         .alias("POSSUI_PREBILLING"),
+
+        # 6. STATUS — alinhado com detalhe: INCORRETO > ALERTA > CORRETO
         F.when(F.col("_tem_incorreto") == 1, F.lit("INCORRETO"))
          .when(F.col("_tem_alerta")    == 1, F.lit("ALERTA"))
          .otherwise(F.lit("CORRETO"))
@@ -374,13 +393,7 @@ df_result = (
         F.date_format(F.current_timestamp(), "yyyy-MM-dd'T'HH:mm:ss.SSSXXX")
          .alias("CRIADO_EM"),
 
-        # 10. STATUS_RETORNO — nulo
-        F.lit(None).cast(StringType()).alias("STATUS_RETORNO"),
-
-        # 11. CHAMADO — nulo
-        F.lit(None).cast(StringType()).alias("CHAMADO"),
-
-        # 12. RESUMO — concatena obs com regra
+        # 10. RESUMO — concatena obs com regra
         F.when(
             (F.col("_tem_incorreto") == 1) & (F.col("_RESUMO") != ""),
             F.col("_RESUMO")
@@ -425,10 +438,12 @@ df_result = (
         _base["ID_CONTA"],
         F.coalesce(df_cli_conta["NOME_CLIENTE"], df_cli_contrato["NOME_CLIENTE_2"], df_cli_codigo["NOME_CLIENTE_3"]).alias("NOME_CLIENTE"),
         F.coalesce(df_cli_conta["CPF_CNPJ"],     df_cli_contrato["CPF_CNPJ_2"],     df_cli_codigo["CPF_CNPJ_3"]).alias("CPF_CNPJ"),
-        _base["ASSET"],
+        _base["SISTEMA"],
+        _base["SEGMENTO"],
+        _base["POSSUI_PREBILLING"],
         _base["STATUS"], _base["STATUS_VALIDACAO"], _base["ANALISTA"],
         _base["OBSERVACAO"], _base["PROBLEMA"], _base["VALOR"], _base["CRIADO_EM"],
-        _base["STATUS_RETORNO"], _base["CHAMADO"], _base["RESUMO"],
+        _base["RESUMO"],
         _base["Ordem_Status"], _base["DATA_ABERTURA_CHAMADO"],
         _base["DT_EMISSAO"], _base["Valor_Positive"],
     )
@@ -551,17 +566,19 @@ c6 = spark.sql(f"SELECT COUNT(*) FROM {TBL_DESTINO} WHERE STATUS='INCORRETO' AND
 checks.append(c6)
 print(f"6. INCORRETO com PROBLEMA: {'✅' if c6 else '❌'}")
 
-# 7. Schema identico (16 colunas)
-cols_ref = ["FATURA","ID_CONTA","NOME_CLIENTE","CPF_CNPJ","ASSET","STATUS","STATUS_VALIDACAO",
-            "ANALISTA","OBSERVACAO","PROBLEMA","VALOR","CRIADO_EM","STATUS_RETORNO",
-            "CHAMADO","RESUMO","Ordem_Status","DATA_ABERTURA_CHAMADO","DT_EMISSAO","Valor_Positive"]
+# 7. Schema identico (20 colunas — schema v2: SISTEMA, SEGMENTO, POSSUI_PREBILLING)
+cols_ref = ["FATURA","ID_CONTA","NOME_CLIENTE","CPF_CNPJ","SISTEMA","SEGMENTO","POSSUI_PREBILLING","STATUS","STATUS_VALIDACAO",
+            "ANALISTA","OBSERVACAO","PROBLEMA","VALOR","CRIADO_EM",
+            "RESUMO","Ordem_Status","DATA_ABERTURA_CHAMADO","DT_EMISSAO","Valor_Positive","ID_LOTE"]
 cols_dst = [c.name for c in spark.table(TBL_DESTINO).schema.fields]
-c7 = cols_dst == cols_ref
+c7 = set(cols_ref).issubset(set(cols_dst))  # subconjunto — tabela pode ter colunas extras de migracoes
 checks.append(c7)
-print(f"7. Schema 19 colunas: {'✅' if c7 else '❌'}")
+print(f"7. Schema 20 colunas (v2): {'✅' if c7 else '❌'}")
 if not c7:
     print(f"   Esperado: {cols_ref}")
     print(f"   Obtido:   {cols_dst}")
+    faltando = set(cols_ref) - set(cols_dst)
+    if faltando: print(f"   Faltando: {faltando}")
 
 print(f"\n{'='*60}")
 print(f"{'✅ CARGA OK' if all(checks) else '⚠️ VER ISSUES'}")

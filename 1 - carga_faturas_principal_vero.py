@@ -285,9 +285,13 @@ df_agg = (
         F.max(F.coalesce(_segmento_col, F.lit("NAO IDENTIFICADO"))).alias("_SEGMENTO"),
 
         # POSSUI_PREBILLING: SIM se o contrato tem PRE BILLING em qualquer linha do ciclo
+        # e o sistema (CRM normalizado) e NG ou ADAPTER — unicos sistemas com essa regra.
         F.max(
-            F.when(F.upper(F.trim(F.col("REGRA"))).isin("PRE-BILLING", "PRE BILLING"), F.lit(1))
-             .otherwise(F.lit(0))
+            F.when(
+                F.upper(F.trim(F.col("REGRA"))).isin("PRE-BILLING", "PRE BILLING") &
+                F.upper(F.trim(F.col("_crm_norm"))).isin("NG", "ADAPTER"),
+                F.lit(1)
+            ).otherwise(F.lit(0))
         ).alias("_possui_pb"),
 
         # Flag: tem regra PRE-BILLING incorreta? (para campo ANALISTA)
@@ -348,8 +352,16 @@ df_result = (
         # 4. SEGMENTO — B2B / B2C
         F.col("_SEGMENTO").cast(StringType()).alias("SEGMENTO"),
 
-        # 5. POSSUI_PREBILLING — SIM se o contrato tem PRE BILLING em qualquer linha do ciclo
-        F.when(F.col("_possui_pb") == 1, F.lit("SIM")).otherwise(F.lit("NAO"))
+        # 5. POSSUI_PREBILLING — SIM somente se:
+        #    (a) o contrato tem PRE BILLING em alguma linha do ciclo (NG ou ADAPTER)
+        #    (b) E o sistema dominante da conta (_SISTEMAS) tambem e NG ou ADAPTER.
+        #    Garante consistencia: conta com SISTEMA=SIMETRA nao recebe SIM
+        #    mesmo que tenha linhas ADAPTER com PRE BILLING (caso de contas mistas).
+        F.when(
+            (F.col("_possui_pb") == 1) &
+            F.upper(F.trim(F.col("_SISTEMAS"))).isin("NG", "ADAPTER"),
+            F.lit("SIM")
+        ).otherwise(F.lit("NAO"))
          .alias("POSSUI_PREBILLING"),
 
         # 6. STATUS — alinhado com detalhe: INCORRETO > ALERTA > CORRETO
@@ -446,6 +458,7 @@ df_result = (
         _base["RESUMO"],
         _base["Ordem_Status"], _base["DATA_ABERTURA_CHAMADO"],
         _base["DT_EMISSAO"], _base["Valor_Positive"],
+        _base["ID_LOTE"],
     )
 )
 

@@ -36,7 +36,7 @@ print(f"Fonte: {TBL_FONTE} → Destino: {TBL_DESTINO} | Ciclo: {CICLO_REF}")
 
 # COMMAND ----------
 
-from pyspark.sql import functions as F
+from pyspark.sql import functions as F, Window
 from pyspark.sql.types import StringType, IntegerType, DateType
 
 # COMMAND ----------
@@ -174,7 +174,7 @@ print(f"[DIAG 6] Apos union — NFCOM/IMPOSTOS: {cnt_diretas_pre:,} | Outras: {c
 # MAGIC | 9 | DADOS_TABELA_VERDADE          | DADOS_TABELA_VERDADE          | direto                                  |
 # MAGIC |10 | ID_LOTE                       | ID_Lote                       | direto                                  |
 # MAGIC |11 | SEGMENTO                      | SEGMENTO                      | B2C/B2B (coalesce NAO IDENTIFICADO)     |
-# MAGIC |12 | POSSUI_PREBILLING             | REGRA (qualquer status)       | SIM se contrato tem PRE BILLING/PRE-BILLING |
+# MAGIC |12 | POSSUI_PREBILLING             | REGRA + CRM (Window)          | SIM para todo (ID_CONTA+SISTEMA) com ao menos 1 linha PRE BILLING |
 # MAGIC |13 | TIPO_SERVICO                  | Tipo_Servico                  | direto                                  |
 # MAGIC |14 | DESCRICAO_SERVICO             | Desc_Servico                  | direto                                  |
 # MAGIC |15 | TIPO_IMPOSTO                  | Tipo_Imposto                  | direto                                  |
@@ -224,27 +224,27 @@ _REGRAS_TAG_OBS = ["VALIDACAO_NFCOM", "VALIDACAO_IMPOSTOS"]
 _tag_from_obs = F.trim(F.split(F.col("OBSERVACAO"), ":").getItem(0))
 
 # ---------------------------------------------------------------------------
-# POSSUI_PREBILLING: verifica se o contrato possui a regra PRE BILLING
-# em qualquer linha do ciclo (qualquer status), entao propaga para todas
-# as linhas do mesmo contrato via broadcast join.
+# POSSUI_PREBILLING: propaga 'SIM' para TODAS as linhas do mesmo
+# (ID_CONTA_CONTRATO, SISTEMA) se o contrato tiver pelo menos 1 linha
+# com REGRA = PRE BILLING/PRE-BILLING. Somente NG e ADAPTER possuem essa regra.
+# Window function evita join e garante propagacao correta sem duplicatas.
 # ---------------------------------------------------------------------------
-_pb_accts = (
-    df_fonte
-    .filter(F.upper(F.trim(F.col("REGRA"))).isin("PRE-BILLING", "PRE BILLING"))
-    .select(F.col("ID_CONTA_CONTRATO").cast(StringType()).alias("_pb_cta"))
-    .distinct()
+_w_pb = Window.partitionBy(
+    F.col("ID_CONTA_CONTRATO").cast(StringType()),
+    F.upper(F.trim(F.col("CRM")))
 )
-df_fonte = (
-    df_fonte
-    .join(
-        F.broadcast(_pb_accts),
-        df_fonte["ID_CONTA_CONTRATO"].cast(StringType()) == _pb_accts["_pb_cta"],
-        how="left"
-    )
-    .withColumn("_possui_pb",
-        F.when(F.col("_pb_cta").isNotNull(), F.lit("SIM")).otherwise(F.lit("NAO"))
-    )
-    .drop("_pb_cta")
+df_fonte = df_fonte.withColumn(
+    "_possui_pb",
+    F.when(
+        F.max(
+            F.when(
+                F.upper(F.trim(F.col("REGRA"))).isin("PRE-BILLING", "PRE BILLING") &
+                F.upper(F.trim(F.col("CRM"))).isin("NG", "ADAPTER"),
+                F.lit(1)
+            ).otherwise(F.lit(0))
+        ).over(_w_pb) == 1,
+        F.lit("SIM")
+    ).otherwise(F.lit("NAO"))
 )
 
 df_result = (
@@ -319,7 +319,9 @@ df_result = (
         # 11. SEGMENTO (origem: coluna SEGMENTO da fonte = B2C/B2B/etc.)
         F.coalesce(F.col("SEGMENTO"), F.lit("NAO IDENTIFICADO")).alias("SEGMENTO"),
 
-        # 12. POSSUI_PREBILLING — SIM se o contrato tem PRE BILLING em qualquer linha do ciclo
+        # 12. POSSUI_PREBILLING — SIM para TODAS as linhas do (ID_CONTA + SISTEMA)
+        #     se o contrato tiver pelo menos 1 linha com PRE BILLING no ciclo.
+        #     Calculado via Window antes do select (ver bloco acima).
         F.col("_possui_pb").alias("POSSUI_PREBILLING"),
 
         # 13. TIPO_SERVICO

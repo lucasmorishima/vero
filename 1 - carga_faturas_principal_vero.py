@@ -22,16 +22,19 @@
 
 from datetime import datetime
 
-# Ciclo automatico: ano-mes atual
-_CICLO_AUTO = datetime.now().strftime("%Y-%m")
+TBL_FONTE    = "accenture.validacao_status_fatura"
+TBL_CLIENTES = "accenture.base_clientes_centralizada"
+TBL_DESTINO  = "accenture.faturas_principal_vero"
+
+# Auto-detecta o ultimo ciclo (ano-mes) com dados reais na tabela fonte.
+# Usa MAX(ID_Lote) — mais robusto que datetime.now(): nao depende do calendario
+# do servidor. Ex: dados de jul carregados em ago ainda serao pegos corretamente.
+_raw = spark.sql(f"SELECT MAX(ID_Lote) AS ultimo FROM {TBL_FONTE}").collect()[0][0]
+_CICLO_AUTO = _raw or datetime.now().strftime("%Y-%m")
 
 dbutils.widgets.removeAll()
 dbutils.widgets.text("ciclo_ref", _CICLO_AUTO, "Ciclo (AAAA-MM)")
 CICLO_REF = dbutils.widgets.get("ciclo_ref")
-
-TBL_FONTE    = "accenture.validacao_status_fatura"
-TBL_CLIENTES = "accenture.base_clientes_centralizada"
-TBL_DESTINO  = "accenture.faturas_principal_vero"
 
 print(f"Fonte: {TBL_FONTE} | Clientes: {TBL_CLIENTES} → Destino: {TBL_DESTINO} | Ciclo: {CICLO_REF}")
 

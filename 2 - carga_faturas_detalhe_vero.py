@@ -74,7 +74,8 @@ CREATE TABLE IF NOT EXISTS {TBL_DESTINO} (
     _Prioridade_Final_da_Fatura     INT,
     _FILTRA_PAGE                    STRING,
     DATA_ABERTURA_CHAMADO           DATE,
-    DT_EMISSAO                      DATE
+    DT_EMISSAO                      DATE,
+    FAIXA                           STRING
 )
 USING DELTA
 TBLPROPERTIES (
@@ -85,7 +86,18 @@ TBLPROPERTIES (
     'delta.autoOptimize.autoCompact'   = 'true'
 )
 """)
-print(f"DDL {TBL_DESTINO} OK — 22 colunas (schema v2)")
+print(f"DDL {TBL_DESTINO} OK — 24 colunas (schema v3)")
+
+# Adiciona colunas novas a tabelas existentes (idempotente — ignora se ja existir)
+for _col_def in ["FAIXA STRING"]:
+    try:
+        spark.sql(f"ALTER TABLE {TBL_DESTINO} ADD COLUMN {_col_def}")
+        print(f"  ALTER TABLE: coluna '{_col_def}' adicionada")
+    except Exception as _e:
+        if "already exists" in str(_e).lower():
+            print(f"  ALTER TABLE: coluna '{_col_def}' ja existe — ok")
+        else:
+            raise
 
 # COMMAND ----------
 
@@ -163,7 +175,7 @@ print(f"[DIAG 6] Apos union — NFCOM/IMPOSTOS: {cnt_diretas_pre:,} | Outras: {c
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 5. Mapeamento 1:1 — 23 colunas (schema v2)
+# MAGIC ## 5. Mapeamento 1:1 — 24 colunas (schema v3)
 # MAGIC
 # MAGIC | # | Destino                       | Fonte                         | Logica                                  |
 # MAGIC |---|-------------------------------|-------------------------------|-----------------------------------------|
@@ -219,6 +231,9 @@ _REGRAS_TAG_PRODUTO = [
 # Regras NFCom/Impostos: TAG extraida da OBSERVACAO (formato "TAG_NAME: descricao")
 _REGRAS_TAG_OBS = ["VALIDACAO_NFCOM", "VALIDACAO_IMPOSTOS"]
 
+# Regras que concatenam FAIXA a TAG (subconjunto de _REGRAS_TAG_PRODUTO)
+_REGRAS_TAG_FAIXA = ["PRE BILLING", "PRE-BILLING", "VALOR FATURA"]
+
 # Regras que usam a propria REGRA como TAG (fallback .otherwise — listadas aqui so para documentacao):
 #   GAP_FATURAMENTO, VALIDACAO_ENCARGOS_MULTA_JUROS, FATURAS_NAO_FATURAVEIS,
 #   ENDERECO_LEGAL, DADOS_CADASTRAIS, ENDERECO_INSTALACAO
@@ -226,6 +241,15 @@ _REGRAS_TAG_OBS = ["VALIDACAO_NFCOM", "VALIDACAO_IMPOSTOS"]
 # Helper: extrai a TAG antes do primeiro ":" na OBSERVACAO
 # Ex: "CFOP_INVALIDO: CFOP fora da lista..." → "CFOP_INVALIDO"
 _tag_from_obs = F.trim(F.split(F.col("OBSERVACAO"), ":").getItem(0))
+
+# Helper: TAG para regras com FAIXA — Produto (ou REGRA) concatenado com FAIXA quando preenchida
+_tag_faixa = F.concat_ws(" - ",
+    F.coalesce(F.col("Produto"), F.col("REGRA")),
+    F.when(
+        F.col("FAIXA").isNotNull() & (F.trim(F.col("FAIXA")) != ""),
+        F.trim(F.col("FAIXA"))
+    )
+)
 
 # ---------------------------------------------------------------------------
 # POSSUI_PREBILLING: propaga 'SIM' para TODAS as linhas do mesmo
@@ -352,6 +376,9 @@ df_result = (
                 F.col("REGRA").isin(_REGRAS_TAG_OBS),
                 F.coalesce(_tag_from_obs, F.col("REGRA"))
             ).when(
+                F.col("REGRA").isin(_REGRAS_TAG_FAIXA),
+                _tag_faixa
+            ).when(
                 F.col("REGRA").isin(_REGRAS_TAG_PRODUTO),
                 F.coalesce(F.col("Produto"), F.col("REGRA"))
             ).otherwise(F.col("REGRA"))
@@ -365,6 +392,8 @@ df_result = (
             F.concat(
                 F.when(F.col("REGRA").isin(_REGRAS_TAG_OBS),
                        F.coalesce(_tag_from_obs, F.col("REGRA")))
+                 .when(F.col("REGRA").isin(_REGRAS_TAG_FAIXA),
+                       _tag_faixa)
                  .when(F.col("REGRA").isin(_REGRAS_TAG_PRODUTO),
                        F.coalesce(F.col("Produto"), F.col("REGRA")))
                  .otherwise(F.col("REGRA")),
@@ -374,6 +403,8 @@ df_result = (
         ).otherwise(
             F.when(F.col("REGRA").isin(_REGRAS_TAG_OBS),
                    F.coalesce(_tag_from_obs, F.col("REGRA")))
+             .when(F.col("REGRA").isin(_REGRAS_TAG_FAIXA),
+                   _tag_faixa)
              .when(F.col("REGRA").isin(_REGRAS_TAG_PRODUTO),
                    F.coalesce(F.col("Produto"), F.col("REGRA")))
              .otherwise(F.col("REGRA"))
@@ -402,6 +433,9 @@ df_result = (
 
         # 28. DT_EMISSAO
         F.current_date().cast(DateType()).alias("DT_EMISSAO"),
+
+        # 29. FAIXA — transcrito diretamente de accenture.validacao_status_fatura
+        F.col("FAIXA").cast(StringType()).alias("FAIXA"),
     )
 )
 
@@ -504,17 +538,17 @@ c1 = n_src == n_dst
 checks.append(c1)
 print(f"1. Espelho 1:1: fonte={n_src:,} vs destino={n_dst:,} {'✅' if c1 else '❌'}")
 
-# 2. Schema 23 colunas (v2)
+# 2. Schema 24 colunas (v3)
 cols_ref = ["FATURA","ID_CONTA","SISTEMA","REGRA","STATUS","SUBSTATUS","OBSERVACAO",
             "DADOS_KENAN","DADOS_TABELA_VERDADE","ID_LOTE","SEGMENTO","POSSUI_PREBILLING",
             "TIPO_SERVICO","DESCRICAO_SERVICO","TIPO_IMPOSTO",
             "STATUS_VALIDACAO","TAG","RESUMO",
             "_Ordem_Status_DET","_Prioridade_Final_da_Fatura","_FILTRA_PAGE",
-            "DATA_ABERTURA_CHAMADO","DT_EMISSAO"]
+            "DATA_ABERTURA_CHAMADO","DT_EMISSAO","FAIXA"]
 cols_dst = [c.name for c in spark.table(TBL_DESTINO).schema.fields]
 c2 = set(cols_ref).issubset(set(cols_dst))
 checks.append(c2)
-print(f"2. Schema 23 colunas (v2): {'✅' if c2 else '❌'}")
+print(f"2. Schema 24 colunas (v3): {'✅' if c2 else '❌'}")
 if not c2:
     faltando = set(cols_ref) - set(cols_dst)
     if faltando: print(f"   Faltando: {faltando}")

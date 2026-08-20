@@ -255,7 +255,7 @@ df_prep = (
 
 df_agg = (
     df_prep
-    .groupBy("ID_CONTA_CONTRATO")
+    .groupBy("ID_CONTA_CONTRATO", "_crm_norm")   # ← sistema como chave: evita mistura SIMETRA+ADAPTER
     .agg(
         # Flag: tem ao menos 1 INCORRETO?
         F.max(
@@ -325,16 +325,16 @@ df_agg = (
 
 _pesos = (
     df_prep
-    .select("ID_CONTA_CONTRATO", "REGRA")
-    .dropDuplicates(["ID_CONTA_CONTRATO", "REGRA"])
+    .select("ID_CONTA_CONTRATO", "_crm_norm", "REGRA")
+    .dropDuplicates(["ID_CONTA_CONTRATO", "_crm_norm", "REGRA"])
     .withColumn("_peso",
         F.when(F.upper(F.trim(F.col("REGRA"))) == F.lit("PRE-BILLING"), F.lit(2))
          .otherwise(F.lit(1)))
-    .groupBy("ID_CONTA_CONTRATO")
+    .groupBy("ID_CONTA_CONTRATO", "_crm_norm")
     .agg(F.sum("_peso").cast(IntegerType()).alias("_ordem_status"))
 )
 
-df_agg = df_agg.join(_pesos, on="ID_CONTA_CONTRATO", how="left")
+df_agg = df_agg.join(_pesos, on=["ID_CONTA_CONTRATO", "_crm_norm"], how="left")
 
 # ---------------------------------------------------------------------------
 # 5c. Montar as 16 colunas exatas
@@ -438,8 +438,8 @@ df_result = (
     )
 )
 
-# Remove duplicatas por ID_CONTA
-df_result = df_result.dropDuplicates(["ID_CONTA"])
+# Remove duplicatas por ID_CONTA + SISTEMA (um registro por conta por sistema)
+df_result = df_result.dropDuplicates(["ID_CONTA", "SISTEMA"])
 
 # JOIN com clientes: tenta IDCONTA → IDCONTRATO → CODIGOCLIENTE
 _base = df_result
